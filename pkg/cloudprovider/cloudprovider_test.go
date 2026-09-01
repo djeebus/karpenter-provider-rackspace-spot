@@ -50,6 +50,8 @@ func (s *stubInstanceTypeProvider) MinBidPrice(context.Context, string, string) 
 	return 0, nil
 }
 
+func (s *stubInstanceTypeProvider) UpdateFromNode(string, corev1.ResourceList) {}
+
 // makeInstanceType mirrors instancetype.translate: one InstanceType with a spot
 // and/or on-demand offering (priced only when > 0), all available.
 func makeInstanceType(name string, spotPrice, onDemandPrice float64) *karpcloudprovider.InstanceType {

@@ -29,7 +29,7 @@ Grab a refresh token from your Rackspace Spot account page, then install with on
 # inline (token from env var or pasted directly)
 helm install karpenter \
   oci://ghcr.io/kanya-approve/charts/karpenter-provider-rackspace-spot \
-  --version 0.1.4 \
+  --version 0.1.5 \
   --namespace karpenter --create-namespace \
   --set spot.cloudspaceName=my-cloudspace \
   --set spot.refreshToken=$SPOT_REFRESH_TOKEN
@@ -43,7 +43,7 @@ kubectl -n karpenter create secret generic karpenter-spot \
 
 helm install karpenter \
   oci://ghcr.io/kanya-approve/charts/karpenter-provider-rackspace-spot \
-  --version 0.1.4 \
+  --version 0.1.5 \
   --namespace karpenter \
   --set spot.cloudspaceName=my-cloudspace \
   --set spot.existingSecret=karpenter-spot
@@ -98,6 +98,32 @@ spec:
 ```
 
 Working manifests live in `config/samples/`.
+
+## Node capacity
+
+A ServerClass advertises the flavor as sold, which is more than the kubelet ends
+up offering: the guest kernel takes a cut of the advertised RAM, mkfs takes a cut
+of the disk, and the kubelet reserves a fixed slice on top. Published capacity
+has to stay at or below what the node reports, or the scheduler nominates pods
+onto nodes that cannot hold them and the provisioner relaunches the same
+too-small flavor indefinitely.
+
+The reserved slice is read from the node kubelet config and is the same on every
+flavor: 500m CPU, 1024Mi memory plus a 100Mi eviction threshold, and 2Gi disk
+plus a 10% nodefs eviction threshold. On top of that, the first node of a given
+flavor is provisioned against a conservative estimate — the advertised size less
+3% memory and 4% disk. Once a node of that flavor registers, the
+`instancetype.capacity` controller records what it actually reported and the
+estimate is replaced by the measurement, keeping the smallest value ever seen.
+The cache is in-memory and rebuilds from the running nodes on startup.
+
+| Env var | Default | Notes |
+| --- | --- | --- |
+| `VM_MEMORY_OVERHEAD_PERCENT` | `0.03` | Shaved off advertised memory until a node of that flavor is measured. |
+| `RACKSPACE_KUBE_RESERVED_CPU` | `500m` | |
+| `RACKSPACE_KUBE_RESERVED_MEMORY` | `1024Mi` | |
+
+Set them via the chart's `extraEnv` if Rackspace retunes its node image.
 
 ## Bidding
 

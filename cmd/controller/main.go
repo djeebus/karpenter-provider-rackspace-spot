@@ -19,6 +19,7 @@ import (
 	karpoperator "sigs.k8s.io/karpenter/pkg/operator"
 
 	rscloudprovider "github.com/kanya-approve/karpenter-provider-rackspace-spot/pkg/cloudprovider"
+	"github.com/kanya-approve/karpenter-provider-rackspace-spot/pkg/controllers/instancetypecapacity"
 	"github.com/kanya-approve/karpenter-provider-rackspace-spot/pkg/controllers/nodeclass"
 	"github.com/kanya-approve/karpenter-provider-rackspace-spot/pkg/controllers/nodelink"
 	rsoperator "github.com/kanya-approve/karpenter-provider-rackspace-spot/pkg/operator"
@@ -35,6 +36,7 @@ func main() {
 	providerControllers := []opcontroller.Controller{
 		nodeclass.NewController(op.GetClient(), op.InstanceTypeProvider, op.Region),
 		nodelink.NewController(op.GetClient()),
+		instancetypecapacity.NewController(op.GetClient(), op.InstanceTypeProvider),
 	}
 
 	op.
