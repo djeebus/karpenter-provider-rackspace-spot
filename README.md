@@ -29,7 +29,7 @@ Grab a refresh token from your Rackspace Spot account page, then install with on
 # inline (token from env var or pasted directly)
 helm install karpenter \
   oci://ghcr.io/kanya-approve/charts/karpenter-provider-rackspace-spot \
-  --version 0.1.5 \
+  --version 0.1.6 \
   --namespace karpenter --create-namespace \
   --set spot.cloudspaceName=my-cloudspace \
   --set spot.refreshToken=$SPOT_REFRESH_TOKEN
@@ -43,7 +43,7 @@ kubectl -n karpenter create secret generic karpenter-spot \
 
 helm install karpenter \
   oci://ghcr.io/kanya-approve/charts/karpenter-provider-rackspace-spot \
-  --version 0.1.5 \
+  --version 0.1.6 \
   --namespace karpenter \
   --set spot.cloudspaceName=my-cloudspace \
   --set spot.existingSecret=karpenter-spot
@@ -124,6 +124,29 @@ The cache is in-memory and rebuilds from the running nodes on startup.
 | `RACKSPACE_KUBE_RESERVED_MEMORY` | `1024Mi` | |
 
 Set them via the chart's `extraEnv` if Rackspace retunes its node image.
+
+## Launch timeout
+
+Rackspace accepts a bid within seconds but can take far longer to attach a
+server to the pool — 17 minutes, measured end to end, for `mh.vs1.large-iad`.
+Karpenter's registration timeout is a fixed 15-minute constant with no flag, and
+when it fires it deletes the NodeClaim and the pool, so Rackspace restarts from
+zero and the flavor can never provision.
+
+The provider therefore holds the NodeClaim in `Launched=Unknown` with reason
+`AwaitingServerAssignment` until the Cloudspace reports a server attached to the
+pool, rather than reporting it launched as soon as the bid is won. That puts the
+wait under `LaunchTimeout`, which upstream exposes as a variable, defaulting here
+to 30 minutes. Pool creation is idempotent — the pool is named for the NodeClaim
+UID — so the retries re-use the in-flight pool instead of restarting it.
+
+If no server is ever attached, the NodeClaim is deleted at the timeout, the pool
+is cleaned up, and the NodePool is marked `NodeRegistrationHealthy=False` so
+karpenter stops favouring that flavor.
+
+| Env var | Default | Notes |
+| --- | --- | --- |
+| `RACKSPACE_LAUNCH_TIMEOUT` | `30m` | Any Go duration string. |
 
 ## Bidding
 

@@ -72,10 +72,12 @@ type composedAPI struct {
 	*rxtmocks.MockSpotNodePoolAPI
 	*rxtmocks.MockOnDemandNodePoolAPI
 	*rxtmocks.MockOrganizationAPI
+	*rxtmocks.MockCloudspaceAPI
 }
 
 func newAPI(ctrl *gomock.Controller) *composedAPI {
 	return &composedAPI{
+		MockCloudspaceAPI:       rxtmocks.NewMockCloudspaceAPI(ctrl),
 		MockSpotNodePoolAPI:     rxtmocks.NewMockSpotNodePoolAPI(ctrl),
 		MockOnDemandNodePoolAPI: rxtmocks.NewMockOnDemandNodePoolAPI(ctrl),
 		MockOrganizationAPI:     rxtmocks.NewMockOrganizationAPI(ctrl),
@@ -224,17 +226,17 @@ func TestRoundBidUp(t *testing.T) {
 		in   float64
 		want string
 	}{
-		{0.001 * 1.2, "0.01"},  // below the 0.01 minimum snaps up to it
-		{0.005, "0.01"},        // the old rung 0.005 is no longer valid
-		{0.01, "0.01"},         // float noise must not bump an already-valid bid
-		{0.011, "0.02"},        // 0.01 rungs below 0.04
+		{0.001 * 1.2, "0.01"}, // below the 0.01 minimum snaps up to it
+		{0.005, "0.01"},       // the old rung 0.005 is no longer valid
+		{0.01, "0.01"},        // float noise must not bump an already-valid bid
+		{0.011, "0.02"},       // 0.01 rungs below 0.04
 		{0.04, "0.04"},
-		{0.041, "0.06"},        // 0.02 rungs below 0.10
+		{0.041, "0.06"}, // 0.02 rungs below 0.10
 		{0.06, "0.06"},
 		{0.10, "0.1"},
-		{0.101, "0.13"},        // 0.03 rungs below 0.20
+		{0.101, "0.13"}, // 0.03 rungs below 0.20
 		{0.19, "0.19"},
-		{0.191, "0.22"},        // 0.05 rungs at/above 0.20
+		{0.191, "0.22"}, // 0.05 rungs at/above 0.20
 		{0.22, "0.22"},
 		{0.221, "0.27"},
 	}
@@ -351,5 +353,43 @@ func TestList_FiltersForeignPools(t *testing.T) {
 		if pool.Labels[KarpenterManagedLabel] != "true" {
 			t.Errorf("List returned a foreign pool %q", pool.Name)
 		}
+	}
+}
+
+func TestServerAssigned(t *testing.T) {
+	const pool = "88614c47-a286-411a-bdf6-58feb42d5818"
+	// Rackspace suffixes the pool UUID when it names the assigned server.
+	assigned := map[string]rxtspot.AssignedServer{
+		pool + "-frh95-wmjl2":                              {ServerClassName: "mh.vs1.large-iad", State: "configured"},
+		"b063dbdd-4152-47d4-bef9-1fe51f064121-jdlv2-4755t": {ServerClassName: "ch.vs1.large-iad", State: "configured"},
+	}
+
+	for _, tc := range []struct {
+		name    string
+		servers map[string]rxtspot.AssignedServer
+		want    bool
+	}{
+		{"server attached to this pool", assigned, true},
+		{"only other pools attached", map[string]rxtspot.AssignedServer{
+			"b063dbdd-4152-47d4-bef9-1fe51f064121-jdlv2-4755t": {State: "configured"},
+		}, false},
+		{"bid won but nothing attached yet", map[string]rxtspot.AssignedServer{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			api := newAPI(ctrl)
+			api.MockCloudspaceAPI.EXPECT().
+				GetCloudspace(gomock.Any(), testOrgID, testCloudspace).
+				Return(&rxtspot.CloudSpace{AssignedServers: tc.servers}, nil)
+
+			p := NewProvider(api, nil, nil, testCloudspace, testOrgID)
+			got, err := p.ServerAssigned(context.Background(), pool)
+			if err != nil {
+				t.Fatalf("ServerAssigned: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("ServerAssigned = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

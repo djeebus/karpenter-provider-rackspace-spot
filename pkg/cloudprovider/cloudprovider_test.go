@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	karpcloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -85,6 +87,8 @@ func makeInstanceType(name string, spotPrice, onDemandPrice float64) *karpcloudp
 			Available: true,
 		})
 	}
+	// translate always sets Overhead; Allocatable() dereferences it.
+	it.Overhead = &karpcloudprovider.InstanceTypeOverhead{}
 	return it
 }
 
@@ -213,7 +217,8 @@ func TestPickInstanceType_PrefersSpotWhenAllowed(t *testing.T) {
 // fakeInstanceProvider records the providerID passed to Delete so the test can
 // assert which pool kind was targeted.
 type fakeInstanceProvider struct {
-	deleted string
+	deleted  string
+	assigned bool
 }
 
 var _ instance.Provider = (*fakeInstanceProvider)(nil)
@@ -229,7 +234,10 @@ func (f *fakeInstanceProvider) Delete(_ context.Context, providerID string) erro
 	return nil
 }
 func (f *fakeInstanceProvider) List(context.Context) ([]*instance.Pool, error) { return nil, nil }
-func (f *fakeInstanceProvider) Cloudspace() string                             { return testCloudspace }
+func (f *fakeInstanceProvider) ServerAssigned(context.Context, string) (bool, error) {
+	return f.assigned, nil
+}
+func (f *fakeInstanceProvider) Cloudspace() string { return testCloudspace }
 
 // Delete must target the pool kind Create actually built — read from the
 // capacity-type label — not the requirement's first value, which can disagree
@@ -253,5 +261,68 @@ func TestDelete_UsesCapacityTypeLabel(t *testing.T) {
 	want := instance.MakeProviderID(testCloudspace, instance.PoolTypeSpot, "uid-9")
 	if f.deleted != want {
 		t.Errorf("deleted %q, want %q (kind from capacity-type label, not requirement)", f.deleted, want)
+	}
+}
+
+// The error type is the contract: a plain error also happens to hold
+// Launched=Unknown today, but only CreateError sets the condition reason.
+func TestCreate_AwaitsServerAssignment(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := apiv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	nodeClass := &apiv1.RackspaceSpotNodeClass{}
+	nodeClass.Name = "default"
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeClass).Build()
+
+	nc := &karpv1.NodeClaim{}
+	nc.UID = "uid-1"
+	nc.Spec.NodeClassRef = &karpv1.NodeClassReference{Kind: NodeClassKind, Name: "default"}
+	nc.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
+		{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeSpot}},
+		{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"gp.small"}},
+	}
+
+	for _, tc := range []struct {
+		name       string
+		assigned   bool
+		wantCreate bool
+	}{
+		{"no server attached yet", false, false},
+		{"server attached", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeInstanceProvider{assigned: tc.assigned}
+			c := &CloudProvider{
+				kubeClient: kubeClient,
+				instances:  f,
+				instanceType: &stubInstanceTypeProvider{list: []*karpcloudprovider.InstanceType{
+					makeInstanceType("gp.small", 0.01, 0.03),
+				}},
+				cloudspace: testCloudspace,
+				region:     testRegion,
+			}
+
+			out, err := c.Create(context.Background(), nc)
+			if tc.wantCreate {
+				if err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Create succeeded, want a retryable CreateError; NodeClaim would be marked Launched before the VM exists")
+			}
+			var createErr *karpcloudprovider.CreateError
+			if !errors.As(err, &createErr) {
+				t.Fatalf("Create error = %T (%v), want *cloudprovider.CreateError so karpenter keeps Launched=Unknown", err, err)
+			}
+			if createErr.ConditionReason != "AwaitingServerAssignment" {
+				t.Errorf("ConditionReason = %q, want AwaitingServerAssignment", createErr.ConditionReason)
+			}
+			if out != nil {
+				t.Errorf("Create returned a NodeClaim alongside the error, want nil")
+			}
+		})
 	}
 }
