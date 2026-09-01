@@ -103,22 +103,30 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (*karp
 		return nil, fmt.Errorf("creating pool: %w", err)
 	}
 
-	// Returning early keeps the NodeClaim in Launched=Unknown, so the wait falls
-	// under LaunchTimeout rather than the registration timeout's fixed 15m const.
-	// Retrying is safe: the pool is keyed on the NodeClaim UID, so a later Create
-	// re-uses the in-flight pool instead of restarting Rackspace's progress.
 	assigned, err := c.instances.ServerAssigned(ctx, pool.Name)
 	if err != nil {
 		return nil, fmt.Errorf("checking server assignment for pool %s: %w", pool.Name, err)
 	}
+
+	// Hydrate in place even when returning the error below: the lifecycle
+	// controller patches the NodeClaim after its reconcilers run, errors and
+	// all, and cluster state reads both fields off the object while we wait.
+	// Without providerID, Cluster.Synced() stays false and blocks provisioning
+	// and disruption cluster-wide; without capacity, StateNode.Capacity() reads
+	// zero and the scheduler provisions a second claim for the same pod.
+	hydrate(nc, pool, instType, capacityType, c.region)
+
+	// Launched=Unknown keeps the wait under LaunchTimeout rather than the
+	// registration timeout's fixed 15m const. Retrying is safe: the pool is
+	// keyed on the NodeClaim UID, so a later Create re-uses the in-flight pool
+	// instead of restarting Rackspace's progress.
 	if !assigned {
 		return nil, karpcloudprovider.NewCreateError(
 			fmt.Errorf("pool %s has no server assigned yet", pool.Name),
 			"AwaitingServerAssignment",
 			fmt.Sprintf("Rackspace has not attached a server to pool %s (status %q)", pool.Name, pool.Status))
 	}
-
-	return c.hydrateClaim(nc, pool, instType, capacityType, c.region), nil
+	return nc, nil
 }
 
 func (c *CloudProvider) Delete(ctx context.Context, nc *karpv1.NodeClaim) error {
@@ -312,6 +320,11 @@ func preferSpot(nc *karpv1.NodeClaim, instanceTypes []*karpcloudprovider.Instanc
 
 func (c *CloudProvider) hydrateClaim(orig *karpv1.NodeClaim, pool *instance.Pool, it *karpcloudprovider.InstanceType, capacityType, region string) *karpv1.NodeClaim {
 	out := orig.DeepCopy()
+	hydrate(out, pool, it, capacityType, region)
+	return out
+}
+
+func hydrate(out *karpv1.NodeClaim, pool *instance.Pool, it *karpcloudprovider.InstanceType, capacityType, region string) {
 	out.Status.ProviderID = pool.ProviderID
 	out.Status.Capacity = it.Capacity
 	out.Status.Allocatable = it.Allocatable()
@@ -324,7 +337,6 @@ func (c *CloudProvider) hydrateClaim(orig *karpv1.NodeClaim, pool *instance.Pool
 	out.Labels[corev1.LabelTopologyRegion] = region
 	out.Labels[corev1.LabelArchStable] = karpv1.ArchitectureAmd64
 	out.Labels[corev1.LabelOSStable] = string(corev1.Linux)
-	return out
 }
 
 // poolToClaim materializes a minimal NodeClaim from an existing pool. Capacity

@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -87,7 +88,13 @@ func makeInstanceType(name string, spotPrice, onDemandPrice float64) *karpcloudp
 			Available: true,
 		})
 	}
-	// translate always sets Overhead; Allocatable() dereferences it.
+	// translate always sets Capacity and Overhead; Allocatable() dereferences
+	// Overhead, and cluster state reads Capacity off in-flight NodeClaims.
+	it.Capacity = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("2"),
+		corev1.ResourceMemory: resource.MustParse("4Gi"),
+		corev1.ResourcePods:   *resource.NewQuantity(110, resource.DecimalSI),
+	}
 	it.Overhead = &karpcloudprovider.InstanceTypeOverhead{}
 	return it
 }
@@ -223,8 +230,9 @@ type fakeInstanceProvider struct {
 
 var _ instance.Provider = (*fakeInstanceProvider)(nil)
 
-func (f *fakeInstanceProvider) Create(context.Context, *apiv1.RackspaceSpotNodeClass, *karpv1.NodeClaim, []*karpcloudprovider.InstanceType, string) (*instance.Pool, error) {
-	return &instance.Pool{}, nil
+func (f *fakeInstanceProvider) Create(_ context.Context, _ *apiv1.RackspaceSpotNodeClass, nc *karpv1.NodeClaim, _ []*karpcloudprovider.InstanceType, _ string) (*instance.Pool, error) {
+	name := string(nc.UID)
+	return &instance.Pool{Name: name, ProviderID: instance.MakeProviderID(testCloudspace, instance.PoolTypeSpot, name)}, nil
 }
 func (f *fakeInstanceProvider) Get(context.Context, string) (*instance.Pool, error) {
 	return nil, instance.ErrPoolNotFound
@@ -303,7 +311,8 @@ func TestCreate_AwaitsServerAssignment(t *testing.T) {
 				region:     testRegion,
 			}
 
-			out, err := c.Create(context.Background(), nc)
+			claim := nc.DeepCopy()
+			_, err := c.Create(context.Background(), claim)
 			if tc.wantCreate {
 				if err != nil {
 					t.Fatalf("Create: %v", err)
@@ -320,8 +329,17 @@ func TestCreate_AwaitsServerAssignment(t *testing.T) {
 			if createErr.ConditionReason != "AwaitingServerAssignment" {
 				t.Errorf("ConditionReason = %q, want AwaitingServerAssignment", createErr.ConditionReason)
 			}
-			if out != nil {
-				t.Errorf("Create returned a NodeClaim alongside the error, want nil")
+			// Cluster.Synced() blocks cluster-wide on an empty providerID, and
+			// StateNode.Capacity() reads zero without capacity, which makes the
+			// scheduler launch a second claim for the same pod.
+			if claim.Status.ProviderID == "" {
+				t.Error("ProviderID is empty while awaiting assignment; Cluster.Synced() will block provisioning cluster-wide")
+			}
+			if len(claim.Status.Capacity) == 0 {
+				t.Error("Capacity is empty while awaiting assignment; the scheduler will provision a duplicate claim")
+			}
+			if claim.Labels[corev1.LabelInstanceTypeStable] != "gp.small" {
+				t.Errorf("instance-type label = %q, want gp.small", claim.Labels[corev1.LabelInstanceTypeStable])
 			}
 		})
 	}
