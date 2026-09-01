@@ -67,6 +67,11 @@ type Provider interface {
 	Get(ctx context.Context, providerID string) (*Pool, error)
 	Delete(ctx context.Context, providerID string) error
 	List(ctx context.Context) ([]*Pool, error)
+	// ServerAssigned reports whether Rackspace has attached a server to the
+	// pool. A won bid is not a delivered VM: pools sit at Fulfilled/wonCount=1
+	// for 15+ minutes before a server appears, and the Cloudspace's
+	// assignedServers is the only field that tracks the real thing.
+	ServerAssigned(ctx context.Context, poolName string) (bool, error)
 	// Cloudspace returns the single Cloudspace name this provider was
 	// configured with at operator startup.
 	Cloudspace() string
@@ -80,11 +85,13 @@ type API interface {
 	rxtspot.SpotNodePoolAPI
 	rxtspot.OnDemandNodePoolAPI
 	rxtspot.OrganizationAPI
+	rxtspot.CloudspaceAPI
 }
 
 type DefaultProvider struct {
 	spot         rxtspot.SpotNodePoolAPI
 	onDemand     rxtspot.OnDemandNodePoolAPI
+	cloudspaces  rxtspot.CloudspaceAPI
 	pricing      pricing.Provider
 	instanceType instancetype.Provider
 
@@ -96,6 +103,7 @@ func NewProvider(api API, pricingProvider pricing.Provider, instanceTypeProvider
 	return &DefaultProvider{
 		spot:         api,
 		onDemand:     api,
+		cloudspaces:  api,
 		pricing:      pricingProvider,
 		instanceType: instanceTypeProvider,
 		cloudspace:   cloudspace,
@@ -159,6 +167,19 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *apiv1.Rackspace
 	default:
 		return nil, fmt.Errorf("unsupported capacity type %q", capacityType)
 	}
+}
+
+func (p *DefaultProvider) ServerAssigned(ctx context.Context, poolName string) (bool, error) {
+	cs, err := p.cloudspaces.GetCloudspace(ctx, p.org, p.cloudspace)
+	if err != nil {
+		return false, fmt.Errorf("getting cloudspace %s: %w", p.cloudspace, err)
+	}
+	for server := range cs.AssignedServers {
+		if strings.HasPrefix(server, poolName) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (p *DefaultProvider) Get(ctx context.Context, providerID string) (*Pool, error) {

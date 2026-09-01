@@ -11,10 +11,15 @@ You may obtain a copy of the License at
 package main
 
 import (
+	"fmt"
+	"os"
+	"time"
+
 	opcontroller "github.com/awslabs/operatorpkg/controller"
 	karpcloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
 	"sigs.k8s.io/karpenter/pkg/controllers"
+	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	karpoperator "sigs.k8s.io/karpenter/pkg/operator"
 
@@ -25,7 +30,22 @@ import (
 	rsoperator "github.com/kanya-approve/karpenter-provider-rackspace-spot/pkg/operator"
 )
 
+// Rackspace took 17m from winning a bid to a joined node when timed end to end,
+// and longer in other attempts. LaunchTimeout is the only budget upstream
+// exposes as a variable; see CloudProvider.Create for why the wait lands here.
+const defaultLaunchTimeout = 30 * time.Minute
+
 func main() {
+	if v := os.Getenv("RACKSPACE_LAUNCH_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			panic(fmt.Errorf("parsing RACKSPACE_LAUNCH_TIMEOUT %q: %w", v, err))
+		}
+		nodeclaimlifecycle.LaunchTimeout = d
+	} else {
+		nodeclaimlifecycle.LaunchTimeout = defaultLaunchTimeout
+	}
+
 	ctx, coreOp := karpoperator.NewOperator()
 	ctx, op := rsoperator.NewOperator(ctx, coreOp)
 

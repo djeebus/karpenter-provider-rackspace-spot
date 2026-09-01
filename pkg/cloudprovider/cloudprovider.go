@@ -103,6 +103,21 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (*karp
 		return nil, fmt.Errorf("creating pool: %w", err)
 	}
 
+	// Returning early keeps the NodeClaim in Launched=Unknown, so the wait falls
+	// under LaunchTimeout rather than the registration timeout's fixed 15m const.
+	// Retrying is safe: the pool is keyed on the NodeClaim UID, so a later Create
+	// re-uses the in-flight pool instead of restarting Rackspace's progress.
+	assigned, err := c.instances.ServerAssigned(ctx, pool.Name)
+	if err != nil {
+		return nil, fmt.Errorf("checking server assignment for pool %s: %w", pool.Name, err)
+	}
+	if !assigned {
+		return nil, karpcloudprovider.NewCreateError(
+			fmt.Errorf("pool %s has no server assigned yet", pool.Name),
+			"AwaitingServerAssignment",
+			fmt.Sprintf("Rackspace has not attached a server to pool %s (status %q)", pool.Name, pool.Status))
+	}
+
 	return c.hydrateClaim(nc, pool, instType, capacityType, c.region), nil
 }
 

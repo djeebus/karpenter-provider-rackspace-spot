@@ -4,9 +4,9 @@ description: Karpenter cloud provider for Rackspace Spot
 type: application
 icon: https://karpenter.sh/logo.png
 # Chart version is independent of appVersion. Bump for any chart change.
-version: 0.1.5
+version: 0.1.6
 # appVersion tracks the controller image tag.
-appVersion: "0.1.5"
+appVersion: "0.1.6"
 kubeVersion: ">=1.29.0-0"
 home: https://github.com/kanya-approve/karpenter-provider-rackspace-spot
 sources:
