@@ -57,6 +57,8 @@ func (*stubInstanceType) MinBidPrice(context.Context, string, string) (float64, 
 	return 0, errors.New("stub: no min bid")
 }
 
+func (*stubInstanceType) UpdateFromNode(string, corev1.ResourceList) {}
+
 const (
 	testOrgID      = "rxt-org-1"
 	testCloudspace = "my-cs"

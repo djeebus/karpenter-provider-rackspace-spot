@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,8 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	karpcloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -36,6 +39,27 @@ const (
 	// Floor for classes whose /disk the API omits (bare metal, deprecated micro).
 	defaultEphemeralStorageGi = 40
 	serverClassesPath         = "/apis/ngpc.rxt.io/v1/serverclasses"
+)
+
+// Publishing raw ServerClass numbers overstates what the kubelet offers, so the
+// scheduler nominates pods onto nodes that cannot hold them and the provisioner
+// relaunches the same too-small flavor forever. Reservations below are
+// kubeReserved+systemReserved and the memory/nodefs evictionHard thresholds from
+// the node kubelet config (/proxy/configz), identical on every flavor. The
+// percentages cover the separate gap between the ServerClass size and what the
+// booted VM reports, worst case observed 2.5% on memory and 3.3% on disk.
+const (
+	defaultKubeReservedCPU              = "500m"
+	defaultKubeReservedMemory           = "1024Mi"
+	defaultKubeReservedEphemeralStorage = "2Gi"
+	defaultMemoryEvictionThreshold      = "100Mi"
+	defaultDiskEvictionPercent          = 0.10
+	defaultVMMemoryOverheadPercent      = 0.03
+	defaultVMDiskOverheadPercent        = 0.04
+
+	envKubeReservedCPU    = "RACKSPACE_KUBE_RESERVED_CPU"
+	envKubeReservedMemory = "RACKSPACE_KUBE_RESERVED_MEMORY"
+	envVMMemoryOverhead   = "VM_MEMORY_OVERHEAD_PERCENT"
 )
 
 // Provider serves Karpenter cloudprovider.InstanceType objects translated from
@@ -47,14 +71,22 @@ type Provider interface {
 	// admission webhook enforces. Pulled from the cached SDK ServerClass
 	// (MinBidPricePerHour), not the percentile feed (which doesn't carry it).
 	MinBidPrice(ctx context.Context, region, name string) (float64, error)
+	// UpdateFromNode keeps the smallest capacity ever reported for an instance
+	// type, so one node that boots with less than its predecessors ratchets the
+	// estimate down and nothing raises it back up.
+	UpdateFromNode(instanceType string, capacity corev1.ResourceList)
 }
+
+// CPU and pods are advertised exactly, so only these two are worth measuring.
+var discoveredResources = []corev1.ResourceName{corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 
 type DefaultProvider struct {
 	client       *rxtspot.RackspaceSpotClient
 	refreshAfter time.Duration
 
-	mu    sync.Mutex
-	cache map[string]regionCache
+	mu         sync.Mutex
+	cache      map[string]regionCache
+	discovered map[string]corev1.ResourceList
 }
 
 type regionCache struct {
@@ -68,6 +100,7 @@ func NewProvider(client *rxtspot.RackspaceSpotClient) *DefaultProvider {
 		client:       client,
 		refreshAfter: 5 * time.Minute,
 		cache:        map[string]regionCache{},
+		discovered:   map[string]corev1.ResourceList{},
 	}
 }
 
@@ -77,7 +110,7 @@ func (p *DefaultProvider) List(ctx context.Context, region string) ([]*karpcloud
 		return nil, err
 	}
 	return lo.Map(c.classes, func(sc rxtspot.ServerClass, _ int) *karpcloudprovider.InstanceType {
-		return translate(sc, c.disks[sc.Name])
+		return translate(sc, c.disks[sc.Name], p.discoveredFor(sc.Name))
 	}), nil
 }
 
@@ -90,7 +123,31 @@ func (p *DefaultProvider) Get(ctx context.Context, region, name string) (*karpcl
 	if !found {
 		return nil, fmt.Errorf("server class %q not found in region %q", name, region)
 	}
-	return translate(sc, c.disks[sc.Name]), nil
+	return translate(sc, c.disks[sc.Name], p.discoveredFor(sc.Name)), nil
+}
+
+func (p *DefaultProvider) UpdateFromNode(instanceType string, capacity corev1.ResourceList) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, name := range discoveredResources {
+		reported, ok := capacity[name]
+		if !ok || reported.IsZero() {
+			continue
+		}
+		if seen, ok := p.discovered[instanceType][name]; ok && seen.Cmp(reported) <= 0 {
+			continue
+		}
+		if p.discovered[instanceType] == nil {
+			p.discovered[instanceType] = corev1.ResourceList{}
+		}
+		p.discovered[instanceType][name] = reported
+	}
+}
+
+func (p *DefaultProvider) discoveredFor(instanceType string) corev1.ResourceList {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.discovered[instanceType].DeepCopy()
 }
 
 func (p *DefaultProvider) MinBidPrice(ctx context.Context, region, name string) (float64, error) {
@@ -172,12 +229,18 @@ func (p *DefaultProvider) fetchDisks(ctx context.Context) (map[string]string, er
 	return disks, nil
 }
 
-func translate(sc rxtspot.ServerClass, disk string) *karpcloudprovider.InstanceType {
+func translate(sc rxtspot.ServerClass, disk string, discovered corev1.ResourceList) *karpcloudprovider.InstanceType {
+	oh := nodeOverhead()
 	capacity := corev1.ResourceList{
 		corev1.ResourceCPU:              parseQuantity(sc.Resources.CPU),
-		corev1.ResourceMemory:           parseQuantity(sc.Resources.Memory),
-		corev1.ResourceEphemeralStorage: ephemeralStorage(disk),
+		corev1.ResourceMemory:           shave(parseQuantity(sc.Resources.Memory), oh.vmMemoryPercent),
+		corev1.ResourceEphemeralStorage: shave(ephemeralStorage(disk), defaultVMDiskOverheadPercent),
 		corev1.ResourcePods:             *resource.NewQuantity(defaultPodsPerNode, resource.DecimalSI),
+	}
+	for _, name := range discoveredResources {
+		if q, ok := discovered[name]; ok {
+			capacity[name] = q
+		}
 	}
 	if gpu := parseQuantity(sc.Resources.GPU); !gpu.IsZero() {
 		capacity[resourceNvidiaGPU] = gpu
@@ -224,11 +287,73 @@ func translate(sc rxtspot.ServerClass, disk string) *karpcloudprovider.InstanceT
 		Capacity:     capacity,
 		Overhead: &karpcloudprovider.InstanceTypeOverhead{
 			KubeReserved: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("100Mi"),
+				corev1.ResourceCPU:              oh.kubeReservedCPU,
+				corev1.ResourceMemory:           oh.kubeReservedMemory,
+				corev1.ResourceEphemeralStorage: resource.MustParse(defaultKubeReservedEphemeralStorage),
+			},
+			EvictionThreshold: corev1.ResourceList{
+				corev1.ResourceMemory:           resource.MustParse(defaultMemoryEvictionThreshold),
+				corev1.ResourceEphemeralStorage: percentOf(capacity[corev1.ResourceEphemeralStorage], defaultDiskEvictionPercent),
 			},
 		},
 	}
+}
+
+var nodeOverhead = sync.OnceValue(loadNodeOverhead)
+
+type overhead struct {
+	kubeReservedCPU    resource.Quantity
+	kubeReservedMemory resource.Quantity
+	vmMemoryPercent    float64
+}
+
+func loadNodeOverhead() overhead {
+	return overhead{
+		kubeReservedCPU:    envQuantity(envKubeReservedCPU, defaultKubeReservedCPU),
+		kubeReservedMemory: envQuantity(envKubeReservedMemory, defaultKubeReservedMemory),
+		vmMemoryPercent:    envPercent(envVMMemoryOverhead, defaultVMMemoryOverheadPercent),
+	}
+}
+
+func envQuantity(key, fallback string) resource.Quantity {
+	v := os.Getenv(key)
+	if v == "" {
+		return resource.MustParse(fallback)
+	}
+	q, err := resource.ParseQuantity(v)
+	if err != nil {
+		log.Log.Error(err, "ignoring unparseable override, using default", "env", key, "value", v, "default", fallback)
+		return resource.MustParse(fallback)
+	}
+	return q
+}
+
+func envPercent(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	switch {
+	case err != nil:
+		log.Log.Error(err, "ignoring unparseable override, using default", "env", key, "value", v, "default", fallback)
+		return fallback
+	case f < 0 || f >= 1:
+		log.Log.Info("ignoring out-of-range override, using default", "env", key, "value", v, "default", fallback)
+		return fallback
+	}
+	return f
+}
+
+func shave(q resource.Quantity, pct float64) resource.Quantity {
+	if q.IsZero() || pct <= 0 {
+		return q
+	}
+	return *resource.NewQuantity(int64(float64(q.Value())*(1-pct)), resource.BinarySI)
+}
+
+func percentOf(q resource.Quantity, pct float64) resource.Quantity {
+	return *resource.NewQuantity(int64(float64(q.Value())*pct), resource.BinarySI)
 }
 
 // rackspaceUnitFix normalizes Rackspace's "<n>GB"/"<n>MB"/"<n>TB"/"<n>KB"
