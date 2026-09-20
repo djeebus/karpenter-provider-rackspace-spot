@@ -485,3 +485,18 @@ func TestTokenWithoutARefreshTokenReportsAnExpiredSeed(t *testing.T) {
 		t.Error("nothing should have been sent")
 	}
 }
+
+// A seed token inside the renewal leeway is not spent yet. With a refresh
+// token that window is when we renew early; without one there is nothing to
+// renew with, so the seconds still on the token beat a certain failure.
+func TestTokenWithoutARefreshTokenSendsASeedInsideTheLeeway(t *testing.T) {
+	rec := &recorder{}
+	nearly := jwt(t, 30*time.Second) // inside the 60s leeway
+	tr := NewTransport(rec, "https://spot.example", "https://login.example", "", nearly)
+
+	do(t, tr, "https://spot.example/apis/ngpc.rxt.io/v1/serverclasses")
+
+	if got, want := rec.headers()[0], "Bearer "+nearly; got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}

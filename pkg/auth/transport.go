@@ -229,7 +229,11 @@ func (t *Transport) Token(ctx context.Context) (string, error) {
 		if tok == "" {
 			return "", errors.New("no rackspace spot token available and no refresh token to obtain one (set SPOT_REFRESH_TOKEN)")
 		}
-		if exp, ok := expiry(tok); ok {
+		// expired() reports spent a leeway before exp, which is the right
+		// call when a refresh is available and the wrong one here: with
+		// nothing to renew with, a token that still has seconds on it is
+		// worth more than a certain failure.
+		if exp, ok := expiry(tok); ok && !time.Now().Before(exp) {
 			return "", fmt.Errorf("rackspace spot token expired at %s and there is no refresh token to renew it (set SPOT_REFRESH_TOKEN)",
 				exp.UTC().Format(time.RFC3339))
 		}
