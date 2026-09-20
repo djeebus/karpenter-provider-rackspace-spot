@@ -196,6 +196,14 @@ the refresh token for a new one first. Nothing runs on a timer, so an idle
 controller carries a spent token until the next call needs one. Either way it
 keeps running indefinitely on a single refresh token.
 
+Renewal needs a refresh token, so it only applies when you set
+`SPOT_REFRESH_TOKEN`. The SDK also accepts a bare `SPOT_ACCESS_TOKEN`, and
+there is nothing to renew from in that configuration: the controller sends that
+token as-is and stops working when Rackspace expires it, which is the old
+behaviour. It does at least say so — `rackspace spot token expired at ... and
+there is no refresh token to renew it` — rather than reporting it as a
+permissions error.
+
 Before this was handled, the token was obtained once at startup and never
 renewed, and roughly an hour in every call began failing with
 

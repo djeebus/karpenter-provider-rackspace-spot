@@ -39,6 +39,14 @@ You may obtain a copy of the License at
 // transport never touches that field: it owns its own token behind an RWMutex
 // and overwrites the Authorization header on the way out. The value the SDK
 // put there is ignored.
+//
+// Renewal needs a refresh token, and the SDK will just as happily be
+// configured with a bare access token: SPOT_ACCESS_TOKEN lands in the client's
+// Token field and SPOT_REFRESH_TOKEN in RefreshToken, so an empty RefreshToken
+// says there is nothing to renew from. The transport then falls back to
+// injecting the startup token unchanged, which is the pre-existing behaviour,
+// minus the misleading permissions error: once that token is demonstrably
+// spent, calls fail saying so instead of coming back as "access denied".
 package auth
 
 import (
@@ -89,6 +97,10 @@ type Transport struct {
 	// recurse.
 	oauthClient *http.Client
 
+	// canRefresh is whether a refresh token was configured at all. Without
+	// one there is nothing to redeem for a new id_token; see Token.
+	canRefresh bool
+
 	// refresher performs the OAuth exchange. It is a field so tests can
 	// substitute one without standing up an OAuth server.
 	refresher func(ctx context.Context, oauthURL, refreshToken string) (string, error)
@@ -100,6 +112,10 @@ type Transport struct {
 // NewTransport wraps base so that every request to baseURL carries a fresh
 // token. seed is the token already obtained at startup; it may be empty, in
 // which case the first request triggers a refresh.
+//
+// Renewal happens only when a refreshToken is given. Without one the transport
+// falls back to injecting seed unchanged, which is what the SDK did before this
+// package existed.
 func NewTransport(base http.RoundTripper, baseURL, oauthURL, refreshToken, seed string) *Transport {
 	if base == nil {
 		base = http.DefaultTransport
@@ -108,6 +124,7 @@ func NewTransport(base http.RoundTripper, baseURL, oauthURL, refreshToken, seed 
 		base:         base,
 		oauthURL:     oauthURL,
 		refreshToken: refreshToken,
+		canRefresh:   refreshToken != "",
 		token:        seed,
 		oauthClient:  &http.Client{Transport: base, Timeout: oauthTimeout},
 	}
@@ -161,6 +178,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// the token to whoever answers there.
 	reqOrigin := originOf(req.URL)
 	if t.apiOrigin == (origin{}) {
+		closeBody(req)
 		return nil, fmt.Errorf("no rackspace spot base URL configured, refusing to send a token to %s://%s", reqOrigin.scheme, reqOrigin.host)
 	}
 	if reqOrigin != t.apiOrigin {
@@ -169,6 +187,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	token, err := t.Token(req.Context())
 	if err != nil {
+		closeBody(req)
 		return nil, fmt.Errorf("refreshing rackspace spot token: %w", err)
 	}
 
@@ -178,13 +197,42 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(clone)
 }
 
+// closeBody discharges the half of the RoundTripper contract that says the
+// body is closed even when no response comes back. http.Client closes it for
+// the paths that reach the wire, but not for a RoundTripper that returns an
+// error of its own, so every early return here has to do it. The SDK only ever
+// hands over a bytes.Reader, where this is a no-op; a caller that passes a
+// file or a pipe would otherwise leak a descriptor per failed request.
+func closeBody(req *http.Request) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+}
+
 // Token returns a token that is valid now, refreshing it if the current one is
-// spent.
+// spent and there is a refresh token to spend.
 func (t *Transport) Token(ctx context.Context) (string, error) {
 	t.mu.RLock()
 	tok := t.token
 	t.mu.RUnlock()
 	if !expired(tok) {
+		return tok, nil
+	}
+
+	// Without a refresh token there is nothing to renew with, so the startup
+	// token is all there is: hand it over and let Rackspace judge it, exactly
+	// as the SDK did before. The one case worth intercepting is a token we can
+	// read and know is spent -- the 401 it earns comes back as "access denied:
+	// you do not have permission to ...", which is what sent people hunting
+	// for a permissions problem in the first place.
+	if !t.canRefresh {
+		if tok == "" {
+			return "", errors.New("no rackspace spot token available and no refresh token to obtain one (set SPOT_REFRESH_TOKEN)")
+		}
+		if exp, ok := expiry(tok); ok {
+			return "", fmt.Errorf("rackspace spot token expired at %s and there is no refresh token to renew it (set SPOT_REFRESH_TOKEN)",
+				exp.UTC().Format(time.RFC3339))
+		}
 		return tok, nil
 	}
 
@@ -277,30 +325,41 @@ func fetchIDToken(ctx context.Context, httpClient *http.Client, oauthURL, refres
 	return body.IDToken, nil
 }
 
-// expired reports whether a JWT is spent, or unusable for any other reason. A
-// token we cannot read is treated as expired: refreshing costs one request,
-// whereas sending a token we failed to parse costs a 401 that surfaces as a
-// misleading permissions error.
-func expired(token string) bool {
+// expiry returns when a JWT expires, and whether it could be read at all. A
+// token we cannot parse reports false rather than a zero time, so callers can
+// tell "spent" from "unreadable" -- the two want different error messages.
+func expiry(token string) (time.Time, bool) {
 	if token == "" {
-		return true
+		return time.Time{}, false
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return true
+		return time.Time{}, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return true
+		return time.Time{}, false
 	}
 	var claims struct {
 		Exp int64 `json:"exp"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return true
+		return time.Time{}, false
 	}
 	if claims.Exp == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
+}
+
+// expired reports whether a JWT is spent, or unusable for any other reason. A
+// token we cannot read is treated as expired: refreshing costs one request,
+// whereas sending a token we failed to parse costs a 401 that surfaces as a
+// misleading permissions error.
+func expired(token string) bool {
+	exp, ok := expiry(token)
+	if !ok {
 		return true
 	}
-	return time.Now().After(time.Unix(claims.Exp, 0).Add(-expiryLeeway))
+	return time.Now().After(exp.Add(-expiryLeeway))
 }

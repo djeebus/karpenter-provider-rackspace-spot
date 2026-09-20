@@ -15,8 +15,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -391,5 +393,95 @@ func TestInstallBoundsAnUntimedClient(t *testing.T) {
 	}
 	if sdk.HTTPClient.Timeout != 0 {
 		t.Error("Install mutated the SDK's own client instead of a copy")
+	}
+}
+
+// closeCounter is a request body that records having been closed.
+type closeCounter struct {
+	closed atomic.Int32
+}
+
+func (c *closeCounter) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *closeCounter) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+// A RoundTripper owns the request body once it is handed one, and http.Client
+// does not close it when RoundTrip returns an error of its own. Every early
+// return has to, or a caller passing a file or a pipe leaks a descriptor per
+// failed request.
+func TestRoundTripClosesBodyOnError(t *testing.T) {
+	t.Run("no base url", func(t *testing.T) {
+		tr := NewTransport(&recorder{}, "", "https://login.example", "rt", jwt(t, time.Hour))
+		body := &closeCounter{}
+		req, err := http.NewRequest(http.MethodPost, "https://spot.example/x", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tr.RoundTrip(req); err == nil {
+			t.Fatal("expected an error")
+		}
+		if got := body.closed.Load(); got != 1 {
+			t.Errorf("body closed %d times, want 1", got)
+		}
+	})
+
+	t.Run("refresh failed", func(t *testing.T) {
+		tr := NewTransport(&recorder{}, "https://spot.example", "https://login.example", "rt", jwt(t, -time.Minute))
+		tr.refresher = func(context.Context, string, string) (string, error) {
+			return "", fmt.Errorf("refresh token revoked")
+		}
+		body := &closeCounter{}
+		req, err := http.NewRequest(http.MethodPost, "https://spot.example/x", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tr.RoundTrip(req); err == nil {
+			t.Fatal("expected an error")
+		}
+		if got := body.closed.Load(); got != 1 {
+			t.Errorf("body closed %d times, want 1", got)
+		}
+	})
+}
+
+// The SDK also accepts a bare access token: SPOT_ACCESS_TOKEN with no
+// SPOT_REFRESH_TOKEN. There is nothing to renew from, so the startup token
+// must still go out rather than every request failing on an exchange that
+// cannot happen. The token here is one we cannot read, so we have no evidence
+// it is spent -- it goes out and Rackspace judges it.
+func TestTokenWithoutARefreshTokenPassesTheSeedThrough(t *testing.T) {
+	rec := &recorder{}
+	tr := NewTransport(rec, "https://spot.example", "https://login.example", "", "opaque-access-token")
+	tr.refresher = func(context.Context, string, string) (string, error) {
+		t.Error("there is no refresh token to redeem")
+		return "", nil
+	}
+
+	do(t, tr, "https://spot.example/apis/ngpc.rxt.io/v1/serverclasses")
+
+	if got, want := rec.headers()[0], "Bearer opaque-access-token"; got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+// A token we can read and know is spent, with no way to renew it, is worth an
+// error that says so: sending it earns a 401 the SDK renders as "access
+// denied: you do not have permission to ...", which is what sent people
+// looking for a permissions problem to begin with.
+func TestTokenWithoutARefreshTokenReportsAnExpiredSeed(t *testing.T) {
+	rec := &recorder{}
+	tr := NewTransport(rec, "https://spot.example", "https://login.example", "", jwt(t, -time.Minute))
+
+	_, err := tr.Token(t.Context())
+	if err == nil {
+		t.Fatal("expected an error for a spent token that cannot be renewed")
+	}
+	if !strings.Contains(err.Error(), "SPOT_REFRESH_TOKEN") {
+		t.Errorf("error should name the missing setting; got %v", err)
+	}
+	if len(rec.headers()) != 0 {
+		t.Error("nothing should have been sent")
 	}
 }
