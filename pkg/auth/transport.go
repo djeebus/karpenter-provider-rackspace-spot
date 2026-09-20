@@ -47,6 +47,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -66,12 +67,27 @@ const oauthTokenPath = "/oauth/token"
 // time of a request that reads the token now and is validated a moment later.
 const expiryLeeway = 60 * time.Second
 
+// oauthTimeout bounds the token exchange when the client it is made on has no
+// timeout of its own -- a hung OAuth request would otherwise block every
+// caller waiting behind the refresh lock.
+const oauthTimeout = 30 * time.Second
+
 // Transport injects a current bearer token into every outbound Rackspace
 // request. The zero value is not usable; construct it with NewTransport.
 type Transport struct {
 	base         http.RoundTripper
 	oauthURL     string
 	refreshToken string
+
+	// apiOrigin is the only scheme+host the token is handed to. Its zero
+	// value means the base URL could not be parsed, and RoundTrip refuses to
+	// send anything rather than guess.
+	apiOrigin origin
+
+	// oauthClient carries the token exchange. It is never the client this
+	// Transport is installed on: routing the refresh through ourselves would
+	// recurse.
+	oauthClient *http.Client
 
 	// refresher performs the OAuth exchange. It is a field so tests can
 	// substitute one without standing up an OAuth server.
@@ -81,20 +97,27 @@ type Transport struct {
 	token string
 }
 
-// NewTransport wraps base so that every request carries a fresh token. seed is
-// the token already obtained at startup; it may be empty, in which case the
-// first request triggers a refresh.
-func NewTransport(base http.RoundTripper, oauthURL, refreshToken, seed string) *Transport {
+// NewTransport wraps base so that every request to baseURL carries a fresh
+// token. seed is the token already obtained at startup; it may be empty, in
+// which case the first request triggers a refresh.
+func NewTransport(base http.RoundTripper, baseURL, oauthURL, refreshToken, seed string) *Transport {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return &Transport{
+	t := &Transport{
 		base:         base,
 		oauthURL:     oauthURL,
 		refreshToken: refreshToken,
 		token:        seed,
-		refresher:    fetchIDToken,
+		oauthClient:  &http.Client{Transport: base, Timeout: oauthTimeout},
 	}
+	t.refresher = func(ctx context.Context, oauthURL, refreshToken string) (string, error) {
+		return fetchIDToken(ctx, t.oauthClient, oauthURL, refreshToken)
+	}
+	if u, err := url.Parse(baseURL); err == nil && u.Scheme != "" && u.Host != "" {
+		t.apiOrigin = originOf(u)
+	}
+	return t
 }
 
 // Install wires a Transport into an SDK client, preserving the transport the
@@ -103,8 +126,23 @@ func NewTransport(base http.RoundTripper, oauthURL, refreshToken, seed string) *
 //
 // The client's own Token field is left as startup set it. Nothing reads it any
 // more, because RoundTrip replaces the header it produces.
+//
+// The token exchange goes out on a shallow copy of the SDK's http.Client, so
+// it keeps the timeout, redirect policy and cookie jar configured for every
+// other call -- and the tuned transport underneath, with its dialer timeout
+// and connection pooling, rather than a bare http.DefaultTransport. The copy
+// is taken before the Transport is installed and pinned to the original base,
+// so the refresh cannot route through the Transport that asked for it.
 func Install(client *rxtspot.RackspaceSpotClient) *Transport {
-	t := NewTransport(client.HTTPClient.Transport, client.OAuthURL, client.RefreshToken, client.Token)
+	oauthClient := *client.HTTPClient
+
+	t := NewTransport(client.HTTPClient.Transport, client.BaseURL, client.OAuthURL, client.RefreshToken, client.Token)
+	oauthClient.Transport = t.base
+	if oauthClient.Timeout == 0 {
+		oauthClient.Timeout = oauthTimeout
+	}
+	t.oauthClient = &oauthClient
+
 	client.HTTPClient.Transport = t
 	return t
 }
@@ -113,6 +151,19 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// The token request itself must go out unmodified, or obtaining a token
 	// would require already having one.
 	if strings.HasSuffix(req.URL.Path, oauthTokenPath) {
+		return t.base.RoundTrip(req)
+	}
+
+	// Only the Spot API gets the token. An http.Client follows redirects by
+	// calling RoundTrip again with the new location, and because the header is
+	// attached here rather than by the caller, the stdlib's own cross-domain
+	// stripping never sees it -- a 302 pointing elsewhere would otherwise hand
+	// the token to whoever answers there.
+	reqOrigin := originOf(req.URL)
+	if t.apiOrigin == (origin{}) {
+		return nil, fmt.Errorf("no rackspace spot base URL configured, refusing to send a token to %s://%s", reqOrigin.scheme, reqOrigin.host)
+	}
+	if reqOrigin != t.apiOrigin {
 		return t.base.RoundTrip(req)
 	}
 
@@ -153,12 +204,43 @@ func (t *Transport) Token(ctx context.Context) (string, error) {
 	return fresh, nil
 }
 
-// fetchIDToken redeems the refresh token for a new id_token.
+// origin is the scheme and host that decide whether a request is talking to
+// the Spot API, compared as a value so a mismatch is one equality check.
+type origin struct {
+	scheme string
+	host   string
+}
+
+// originOf normalizes a URL down to its origin: case-insensitive scheme and
+// host, with the port dropped when it is the scheme's default, so that
+// https://spot.example and https://SPOT.example:443 are one origin.
+func originOf(u *url.URL) origin {
+	o := origin{
+		scheme: strings.ToLower(u.Scheme),
+		host:   strings.ToLower(u.Hostname()),
+	}
+	if port := u.Port(); port != "" && port != defaultPort(o.scheme) {
+		o.host = net.JoinHostPort(o.host, port)
+	}
+	return o
+}
+
+func defaultPort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	}
+	return ""
+}
+
+// fetchIDToken redeems the refresh token for a new id_token on httpClient.
 //
 // This duplicates what the SDK's Authenticate() does, deliberately. Calling
 // the SDK method instead would write to the shared client's Token field, which
 // is the race this package exists to avoid.
-func fetchIDToken(ctx context.Context, oauthURL, refreshToken string) (string, error) {
+func fetchIDToken(ctx context.Context, httpClient *http.Client, oauthURL, refreshToken string) (string, error) {
 	if refreshToken == "" {
 		return "", errors.New("no refresh token configured (set SPOT_REFRESH_TOKEN)")
 	}
@@ -174,9 +256,7 @@ func fetchIDToken(ctx context.Context, oauthURL, refreshToken string) (string, e
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	// A bare client, not the SDK's: the SDK's is the one this transport is
-	// installed on, and routing through it would recurse.
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}

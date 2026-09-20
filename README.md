@@ -190,8 +190,11 @@ The full set has to be passed because `FEATURE_GATES` is parsed as a complete ov
 The controller reads `SPOT_REFRESH_TOKEN` (and other `SPOT_*` env vars per [spot-go-sdk Config](https://github.com/rackspace-spot/spot-go-sdk/blob/main/api/v1/client.go)). The chart wires this from `spot.refreshToken` or `spot.existingSecret`.
 
 The refresh token is redeemed for an `id_token` that Rackspace expires after
-about an hour. The controller renews it in the background, so it keeps running
-indefinitely on a single refresh token.
+about an hour. The controller renews it on demand: before each API request it
+checks the current token and, if it is within 60 seconds of expiring, redeems
+the refresh token for a new one first. Nothing runs on a timer, so an idle
+controller carries a spent token until the next call needs one. Either way it
+keeps running indefinitely on a single refresh token.
 
 Before this was handled, the token was obtained once at startup and never
 renewed, and roughly an hour in every call began failing with
