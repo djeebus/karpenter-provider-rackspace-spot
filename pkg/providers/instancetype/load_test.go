@@ -41,6 +41,9 @@ type spotAPI struct {
 	inFlight  atomic.Int32 // serverclasses requests that have begun
 }
 
+// handler serves the two endpoints a refresh touches: /regions, which
+// ListServerClasses validates the region against, and /serverclasses, which
+// both ListServerClasses and fetchDisks read.
 func (s *spotAPI) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/apis/ngpc.rxt.io/v1/regions", func(w http.ResponseWriter, _ *http.Request) {
@@ -64,6 +67,9 @@ func (s *spotAPI) handler() http.Handler {
 	return mux
 }
 
+// newTestProvider wires a provider to an httptest server backed by api, so the
+// tests exercise the real SDK path. Retries are kept short so a test that does
+// hit one does not inherit the production backoff.
 func newTestProvider(t *testing.T, api *spotAPI) (*DefaultProvider, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(api.handler())
@@ -224,6 +230,7 @@ func TestListReturnsTranslatedServerClasses(t *testing.T) {
 	}
 }
 
+// waitFor polls cond until it holds, failing the test if it never does.
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

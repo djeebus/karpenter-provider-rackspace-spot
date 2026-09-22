@@ -219,6 +219,7 @@ func (p *DefaultProvider) cached(region string) (regionCache, bool) {
 	return c, ok && time.Since(c.fetched) < p.refreshAfter
 }
 
+// store records the region's freshly fetched entry.
 func (p *DefaultProvider) store(region string, c regionCache) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
