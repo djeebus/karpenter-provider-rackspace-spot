@@ -24,11 +24,16 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-const testRegion = "us-central-ord-1"
+const (
+	testRegion = "us-central-ord-1"
+	// Unsigned test JWT with {"exp":4102444800}, which expires in 2100.
+	testToken = "test.eyJleHAiOjQxMDI0NDQ4MDB9.test"
+)
 
 // spotAPI is a stand-in for the two Rackspace endpoints a refresh touches.
 // gate, when non-nil, holds the serverclasses response open so a refresh can be
 // observed while it is in flight.
+// beforeServerClasses runs before responding, while the refresh is in flight.
 //
 // Refreshes are counted on /regions rather than /serverclasses. ListServerClasses
 // checks the region exactly once per call, whereas /serverclasses is requested
@@ -36,9 +41,10 @@ const testRegion = "us-central-ord-1"
 // reads the raw payload for the disk field the SDK drops. Counting /regions
 // therefore counts refreshes, not requests.
 type spotAPI struct {
-	gate      chan struct{}
-	refreshes atomic.Int32 // one per load() that actually fetched
-	inFlight  atomic.Int32 // serverclasses requests that have begun
+	gate                chan struct{}
+	beforeServerClasses func()
+	refreshes           atomic.Int32 // one per load() that actually fetched
+	inFlight            atomic.Int32 // serverclasses requests that have begun
 }
 
 // handler serves the two endpoints a refresh touches: /regions, which
@@ -56,6 +62,9 @@ func (s *spotAPI) handler() http.Handler {
 		if s.gate != nil {
 			<-s.gate
 		}
+		if s.beforeServerClasses != nil {
+			s.beforeServerClasses()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"items":[{
 			"metadata":{"name":"gp.vs1.large-ord"},
@@ -70,7 +79,7 @@ func (s *spotAPI) handler() http.Handler {
 // newTestProvider wires a provider to an httptest server backed by api, so the
 // tests exercise the real SDK path. Retries are kept short so a test that does
 // hit one does not inherit the production backoff.
-func newTestProvider(t *testing.T, api *spotAPI) (*DefaultProvider, *httptest.Server) {
+func newTestProvider(t *testing.T, api *spotAPI) *DefaultProvider {
 	t.Helper()
 	srv := httptest.NewServer(api.handler())
 	t.Cleanup(srv.Close)
@@ -78,7 +87,7 @@ func newTestProvider(t *testing.T, api *spotAPI) (*DefaultProvider, *httptest.Se
 	client := &rxtspot.RackspaceSpotClient{
 		BaseURL:    srv.URL,
 		HTTPClient: srv.Client(),
-		Token:      "test-token",
+		Token:      testToken,
 		RetryConfig: rxtspot.RetryConfig{
 			MaxRetries:          1,
 			RetryWaitMax:        time.Second,
@@ -87,7 +96,7 @@ func newTestProvider(t *testing.T, api *spotAPI) (*DefaultProvider, *httptest.Se
 			InitialInterval:     time.Millisecond,
 		},
 	}
-	return NewProvider(client), srv
+	return NewProvider(client)
 }
 
 // The regression: load used to hold the same mutex that guards the capacity
@@ -95,36 +104,39 @@ func newTestProvider(t *testing.T, api *spotAPI) (*DefaultProvider, *httptest.Se
 // The SDK's retry budget is minutes, so that stall could be minutes long.
 func TestUpdateFromNodeNotBlockedByInFlightRefresh(t *testing.T) {
 	api := &spotAPI{gate: make(chan struct{})}
-	p, _ := newTestProvider(t, api)
+	p := newTestProvider(t, api)
 
-	refreshDone := make(chan struct{})
-	go func() {
-		defer close(refreshDone)
+	var wg sync.WaitGroup
+	release := sync.OnceFunc(func() { close(api.gate) })
+	t.Cleanup(func() {
+		release()
+		wg.Wait()
+	})
+	wg.Go(func() {
 		if _, err := p.load(context.Background(), testRegion); err != nil {
 			t.Errorf("load: %v", err)
 		}
-	}()
+	})
 
 	// Wait until the refresh is genuinely in flight and parked in the handler.
 	waitFor(t, func() bool { return api.inFlight.Load() >= 1 })
 
 	updated := make(chan struct{})
-	go func() {
+	wg.Go(func() {
 		defer close(updated)
 		p.UpdateFromNode("gp.vs1.large-ord", corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("15Gi"),
 		})
-	}()
+	})
 
 	select {
 	case <-updated:
 	case <-time.After(2 * time.Second):
-		close(api.gate)
 		t.Fatal("UpdateFromNode blocked on the in-flight refresh")
 	}
 
-	close(api.gate)
-	<-refreshDone
+	release()
+	wg.Wait()
 
 	if got := p.discoveredFor("gp.vs1.large-ord")[corev1.ResourceMemory]; got.IsZero() {
 		t.Error("measurement recorded during the refresh was lost")
@@ -134,44 +146,50 @@ func TestUpdateFromNodeNotBlockedByInFlightRefresh(t *testing.T) {
 // discoveredFor is on the read path for List/Get, and must likewise not wait
 // on a refresh it is not the cause of.
 func TestDiscoveredForNotBlockedByInFlightRefresh(t *testing.T) {
-	api := &spotAPI{gate: make(chan struct{})}
-	p, _ := newTestProvider(t, api)
-
-	go func() { _, _ = p.load(context.Background(), testRegion) }()
-	waitFor(t, func() bool { return api.inFlight.Load() >= 1 })
-
-	done := make(chan struct{})
-	go func() { defer close(done); p.discoveredFor("gp.vs1.large-ord") }()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		close(api.gate)
-		t.Fatal("discoveredFor blocked on the in-flight refresh")
+	api := &spotAPI{}
+	p := newTestProvider(t, api)
+	var reads atomic.Int32
+	api.beforeServerClasses = func() {
+		p.discoveredFor("gp.vs1.large-ord")
+		reads.Add(1)
 	}
-	close(api.gate)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if _, err := p.load(ctx, testRegion); err != nil {
+		t.Fatalf("load could not complete while calling discoveredFor: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("discoveredFor blocked until the refresh timed out: %v", err)
+	}
+	if got := reads.Load(); got != 2 {
+		t.Errorf("expected discoveredFor to complete during both serverclasses requests, got %d calls", got)
+	}
 }
 
 // Dropping the shared lock must not cost the dedup it was providing: a burst
 // of callers on a cold cache should still produce one request, not one each.
 func TestConcurrentLoadIssuesOneRequest(t *testing.T) {
 	api := &spotAPI{gate: make(chan struct{})}
-	p, _ := newTestProvider(t, api)
+	p := newTestProvider(t, api)
 
 	var wg sync.WaitGroup
+	release := sync.OnceFunc(func() { close(api.gate) })
+	t.Cleanup(func() {
+		release()
+		wg.Wait()
+	})
 	for range 25 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if _, err := p.load(context.Background(), testRegion); err != nil {
 				t.Errorf("load: %v", err)
 			}
-		}()
+		})
 	}
 	// Let them all pile up on the fetch lock before releasing the handler.
 	waitFor(t, func() bool { return api.inFlight.Load() >= 1 })
 	time.Sleep(50 * time.Millisecond)
-	close(api.gate)
+	release()
 	wg.Wait()
 
 	if got := api.refreshes.Load(); got != 1 {
@@ -182,7 +200,7 @@ func TestConcurrentLoadIssuesOneRequest(t *testing.T) {
 // A warm entry must still be served from cache rather than refetched.
 func TestLoadServesFromCache(t *testing.T) {
 	api := &spotAPI{}
-	p, _ := newTestProvider(t, api)
+	p := newTestProvider(t, api)
 
 	for range 5 {
 		if _, err := p.load(context.Background(), testRegion); err != nil {
@@ -197,7 +215,7 @@ func TestLoadServesFromCache(t *testing.T) {
 // A stale entry must be refetched once the TTL lapses.
 func TestLoadRefreshesAfterTTL(t *testing.T) {
 	api := &spotAPI{}
-	p, _ := newTestProvider(t, api)
+	p := newTestProvider(t, api)
 	p.refreshAfter = 10 * time.Millisecond
 
 	if _, err := p.load(context.Background(), testRegion); err != nil {
@@ -216,7 +234,7 @@ func TestLoadRefreshesAfterTTL(t *testing.T) {
 // alongside the locking changes.
 func TestListReturnsTranslatedServerClasses(t *testing.T) {
 	api := &spotAPI{}
-	p, _ := newTestProvider(t, api)
+	p := newTestProvider(t, api)
 
 	its, err := p.List(context.Background(), testRegion)
 	if err != nil {
@@ -227,6 +245,9 @@ func TestListReturnsTranslatedServerClasses(t *testing.T) {
 	}
 	if cpu := its[0].Capacity[corev1.ResourceCPU]; cpu.Value() != 4 {
 		t.Errorf("cpu = %v, want 4", cpu.Value())
+	}
+	if got, want := its[0].Capacity[corev1.ResourceEphemeralStorage], shave(resource.MustParse("60Gi"), defaultVMDiskOverheadPercent); got.Cmp(want) != 0 {
+		t.Errorf("ephemeral-storage capacity = %q, want %q (60Gi disk less VM overhead)", got.String(), want.String())
 	}
 }
 
