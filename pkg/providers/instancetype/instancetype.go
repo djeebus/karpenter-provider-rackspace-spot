@@ -84,16 +84,13 @@ type DefaultProvider struct {
 	client       *rxtspot.RackspaceSpotClient
 	refreshAfter time.Duration
 
-	// mu guards cache and discovered. It is only ever held around map access,
-	// never across a request to Rackspace -- see load.
-	mu         sync.Mutex
-	cache      map[string]regionCache
-	discovered map[string]corev1.ResourceList
+	mu    sync.Mutex
+	cache map[string]regionCache
 
-	// fetchMu guards fetches; fetches holds one lock per region, serializing
-	// refreshes for that region without touching mu.
-	fetchMu sync.Mutex
-	fetches map[string]*sync.Mutex
+	// discoveredMu is separate from mu so a slow refresh in load does not
+	// block nodes reporting capacity.
+	discoveredMu sync.Mutex
+	discovered   map[string]corev1.ResourceList
 }
 
 type regionCache struct {
@@ -108,7 +105,6 @@ func NewProvider(client *rxtspot.RackspaceSpotClient) *DefaultProvider {
 		refreshAfter: 5 * time.Minute,
 		cache:        map[string]regionCache{},
 		discovered:   map[string]corev1.ResourceList{},
-		fetches:      map[string]*sync.Mutex{},
 	}
 }
 
@@ -135,8 +131,8 @@ func (p *DefaultProvider) Get(ctx context.Context, region, name string) (*karpcl
 }
 
 func (p *DefaultProvider) UpdateFromNode(instanceType string, capacity corev1.ResourceList) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.discoveredMu.Lock()
+	defer p.discoveredMu.Unlock()
 	for _, name := range discoveredResources {
 		reported, ok := capacity[name]
 		if !ok || reported.IsZero() {
@@ -153,8 +149,8 @@ func (p *DefaultProvider) UpdateFromNode(instanceType string, capacity corev1.Re
 }
 
 func (p *DefaultProvider) discoveredFor(instanceType string) corev1.ResourceList {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.discoveredMu.Lock()
+	defer p.discoveredMu.Unlock()
 	return p.discovered[instanceType].DeepCopy()
 }
 
@@ -170,34 +166,12 @@ func (p *DefaultProvider) MinBidPrice(ctx context.Context, region, name string) 
 	return parsePrice(sc.MinBidPricePerHour), nil
 }
 
-// load returns the region's ServerClasses, refreshing them once refreshAfter
-// has elapsed.
-//
-// The refresh deliberately runs without mu held. mu also guards the capacity
-// measurements that UpdateFromNode writes, and holding it across a request to
-// Rackspace makes every node that reports capacity wait on that request. The
-// SDK retries with a backoff bounded by SPOT_RETRY_WAIT_MAX, 10 minutes by
-// default, so a Rackspace outage could stall the capacity feedback loop -- and
-// every caller of discoveredFor with it -- for that long, for a refresh none of
-// them were waiting on.
-//
-// fetches keeps the property that made the single lock attractive: one refresh
-// per region in flight at a time, rather than one per caller that happens to
-// arrive on a cold cache.
 func (p *DefaultProvider) load(ctx context.Context, region string) (regionCache, error) {
-	if c, ok := p.cached(region); ok {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.cache[region]; ok && time.Since(c.fetched) < p.refreshAfter {
 		return c, nil
 	}
-
-	fetch := p.fetchLock(region)
-	fetch.Lock()
-	defer fetch.Unlock()
-
-	// Whoever held this lock before us may have just refreshed the cache.
-	if c, ok := p.cached(region); ok {
-		return c, nil
-	}
-
 	list, err := p.client.ListServerClasses(ctx, region)
 	if err != nil {
 		return regionCache{}, fmt.Errorf("listing server classes in %s: %w", region, err)
@@ -207,34 +181,8 @@ func (p *DefaultProvider) load(ctx context.Context, region string) (regionCache,
 		disks = map[string]string{} // non-fatal: translate falls back to the floor
 	}
 	c := regionCache{classes: list.Items, disks: disks, fetched: time.Now()}
-	p.store(region, c)
-	return c, nil
-}
-
-func (p *DefaultProvider) cached(region string) (regionCache, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.cache[region]
-	return c, ok && time.Since(c.fetched) < p.refreshAfter
-}
-
-func (p *DefaultProvider) store(region string, c regionCache) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.cache[region] = c
-}
-
-// fetchLock returns the lock serializing refreshes for a region, creating it
-// on first use. Regions are the Cloudspace's, so this map stays tiny.
-func (p *DefaultProvider) fetchLock(region string) *sync.Mutex {
-	p.fetchMu.Lock()
-	defer p.fetchMu.Unlock()
-	m, ok := p.fetches[region]
-	if !ok {
-		m = &sync.Mutex{}
-		p.fetches[region] = m
-	}
-	return m
+	return c, nil
 }
 
 // fetchDisks maps ServerClass name to its raw disk string. The SDK decodes
