@@ -211,7 +211,6 @@ func (p *DefaultProvider) load(ctx context.Context, region string) (regionCache,
 	return c, nil
 }
 
-// cached returns the region's entry when it is present and still fresh.
 func (p *DefaultProvider) cached(region string) (regionCache, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -219,7 +218,6 @@ func (p *DefaultProvider) cached(region string) (regionCache, bool) {
 	return c, ok && time.Since(c.fetched) < p.refreshAfter
 }
 
-// store records the region's freshly fetched entry.
 func (p *DefaultProvider) store(region string, c regionCache) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
