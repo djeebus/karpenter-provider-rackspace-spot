@@ -146,7 +146,6 @@ func TestDiscoveredForNotBlockedByInFlightRefresh(t *testing.T) {
 	}
 }
 
-// waitFor polls cond until it holds, failing the test if it never does.
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
