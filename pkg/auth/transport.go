@@ -32,13 +32,14 @@ You may obtain a copy of the License at
 // asking each call site to remember to refresh first.
 //
 // It also sidesteps a data race. The obvious alternative, calling the SDK's
-// Authenticate() before each request, writes RackspaceSpotClient.Token while
-// other goroutines are reading it in authHeader(). Karpenter runs its
-// reconcilers with large worker counts, so those reads and writes genuinely
-// overlap, and a torn read of a string header is not a hypothetical. This
-// transport never touches that field: it owns its own token behind an RWMutex
-// and overwrites the Authorization header on the way out. The value the SDK
-// put there is ignored.
+// Authenticate() on the shared client before each request, writes
+// RackspaceSpotClient.Token while other goroutines are reading it in
+// authHeader(). Karpenter runs its reconcilers with large worker counts, so
+// those reads and writes genuinely overlap, and a torn read of a string header
+// is not a hypothetical. This transport still uses Authenticate(), but on a
+// private copy of the client that only it touches, under its own mutex, and
+// overwrites the Authorization header on the way out. The value the SDK put
+// there is ignored.
 //
 // Renewal needs a refresh token, and the SDK will just as happily be
 // configured with a bare access token: SPOT_ACCESS_TOKEN lands in the client's
@@ -81,60 +82,28 @@ const expiryLeeway = 60 * time.Second
 const oauthTimeout = 30 * time.Second
 
 // Transport injects a current bearer token into every outbound Rackspace
-// request. The zero value is not usable; construct it with NewTransport.
+// request. The zero value is not usable; build one with Install.
 type Transport struct {
-	base         http.RoundTripper
-	oauthURL     string
-	refreshToken string
+	base http.RoundTripper
 
 	// apiOrigin is the only scheme+host the token is handed to. Its zero
 	// value means the base URL could not be parsed, and RoundTrip refuses to
 	// send anything rather than guess.
 	apiOrigin origin
 
-	// oauthClient carries the token exchange. It is never the client this
-	// Transport is installed on: routing the refresh through ourselves would
-	// recurse.
-	oauthClient *http.Client
+	// sdk is a private copy of the SDK client, used only to call Authenticate.
+	// Authenticate writes sdk.Token, so the copy is what keeps that write off
+	// the shared client the rest of the process reads. Its HTTPClient is the
+	// original, un-wrapped one: routing the refresh through this Transport
+	// would recurse.
+	sdk *rxtspot.RackspaceSpotClient
 
 	// canRefresh is whether a refresh token was configured at all. Without
 	// one there is nothing to redeem for a new id_token; see Token.
 	canRefresh bool
 
-	// refresher performs the OAuth exchange. It is a field so tests can
-	// substitute one without standing up an OAuth server.
-	refresher func(ctx context.Context, oauthURL, refreshToken string) (string, error)
-
-	mu    sync.RWMutex
-	token string
-}
-
-// NewTransport wraps base so that every request to baseURL carries a fresh
-// token. seed is the token already obtained at startup; it may be empty, in
-// which case the first request triggers a refresh.
-//
-// Renewal happens only when a refreshToken is given. Without one the transport
-// falls back to injecting seed unchanged, which is what the SDK did before this
-// package existed.
-func NewTransport(base http.RoundTripper, baseURL, oauthURL, refreshToken, seed string) *Transport {
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	t := &Transport{
-		base:         base,
-		oauthURL:     oauthURL,
-		refreshToken: refreshToken,
-		canRefresh:   refreshToken != "",
-		token:        seed,
-		oauthClient:  &http.Client{Transport: base, Timeout: oauthTimeout},
-	}
-	t.refresher = func(ctx context.Context, oauthURL, refreshToken string) (string, error) {
-		return fetchIDToken(ctx, t.oauthClient, oauthURL, refreshToken)
-	}
-	if u, err := url.Parse(baseURL); err == nil && u.Scheme != "" && u.Host != "" {
-		t.apiOrigin = originOf(u)
-	}
-	return t
+	// mu guards sdk, whose Authenticate both reads and writes Token.
+	mu sync.Mutex
 }
 
 // Install wires a Transport into an SDK client, preserving the transport the
@@ -151,14 +120,27 @@ func NewTransport(base http.RoundTripper, baseURL, oauthURL, refreshToken, seed 
 // is taken before the Transport is installed and pinned to the original base,
 // so the refresh cannot route through the Transport that asked for it.
 func Install(client *rxtspot.RackspaceSpotClient) *Transport {
-	oauthClient := *client.HTTPClient
+	base := client.HTTPClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
 
-	t := NewTransport(client.HTTPClient.Transport, client.BaseURL, client.OAuthURL, client.RefreshToken, client.Token)
-	oauthClient.Transport = t.base
+	oauthClient := *client.HTTPClient
+	oauthClient.Transport = base
 	if oauthClient.Timeout == 0 {
 		oauthClient.Timeout = oauthTimeout
 	}
-	t.oauthClient = &oauthClient
+	sdk := *client
+	sdk.HTTPClient = &oauthClient
+
+	t := &Transport{
+		base:       base,
+		sdk:        &sdk,
+		canRefresh: client.RefreshToken != "",
+	}
+	if u, err := url.Parse(client.BaseURL); err == nil && u.Scheme != "" && u.Host != "" {
+		t.apiOrigin = originOf(u)
+	}
 
 	client.HTTPClient.Transport = t
 	return t
@@ -210,29 +192,24 @@ func closeBody(req *http.Request) {
 }
 
 // Token returns a token that is valid now, refreshing it if the current one is
-// spent and there is a refresh token to spend.
+// spent and there is a refresh token to spend. The expiry check, the OAuth
+// exchange and its error handling are the SDK's Authenticate.
 func (t *Transport) Token(ctx context.Context) (string, error) {
-	t.mu.RLock()
-	tok := t.token
-	t.mu.RUnlock()
-	if !expired(tok) {
-		return tok, nil
-	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	// Without a refresh token there is nothing to renew with, so the startup
 	// token is all there is: hand it over and let Rackspace judge it, exactly
 	// as the SDK did before. The one case worth intercepting is a token we can
 	// read and know is spent -- the 401 it earns comes back as "access denied:
 	// you do not have permission to ...", which is what sent people hunting
-	// for a permissions problem in the first place.
+	// for a permissions problem in the first place. Authenticate would instead
+	// post an empty refresh token and report a bare 400.
 	if !t.canRefresh {
+		tok := t.sdk.Token
 		if tok == "" {
 			return "", errors.New("no rackspace spot token available and no refresh token to obtain one (set SPOT_REFRESH_TOKEN)")
 		}
-		// expired() reports spent a leeway before exp, which is the right
-		// call when a refresh is available and the wrong one here: with
-		// nothing to renew with, a token that still has seconds on it is
-		// worth more than a certain failure.
 		if exp, ok := expiry(tok); ok && !time.Now().Before(exp) {
 			return "", fmt.Errorf("rackspace spot token expired at %s and there is no refresh token to renew it (set SPOT_REFRESH_TOKEN)",
 				exp.UTC().Format(time.RFC3339))
@@ -240,20 +217,10 @@ func (t *Transport) Token(ctx context.Context) (string, error) {
 		return tok, nil
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	// Another goroutine may have refreshed while we waited for the write lock;
-	// without this, a burst of concurrent requests past the expiry would each
-	// redeem the refresh token.
-	if !expired(t.token) {
-		return t.token, nil
-	}
-	fresh, err := t.refresher(ctx, t.oauthURL, t.refreshToken)
-	if err != nil {
-		return "", err
-	}
-	t.token = fresh
-	return fresh, nil
+	// Authenticate returns the cached token until it is within 60s of expiring,
+	// so a burst of concurrent requests past the expiry redeems the refresh
+	// token once: the rest queue on mu and then hit the cache.
+	return t.sdk.Authenticate(ctx)
 }
 
 // origin is the scheme and host that decide whether a request is talking to
@@ -287,48 +254,6 @@ func defaultPort(scheme string) string {
 	return ""
 }
 
-// fetchIDToken redeems the refresh token for a new id_token on httpClient.
-//
-// This duplicates what the SDK's Authenticate() does, deliberately. Calling
-// the SDK method instead would write to the shared client's Token field, which
-// is the race this package exists to avoid.
-func fetchIDToken(ctx context.Context, httpClient *http.Client, oauthURL, refreshToken string) (string, error) {
-	if refreshToken == "" {
-		return "", errors.New("no refresh token configured (set SPOT_REFRESH_TOKEN)")
-	}
-
-	form := url.Values{}
-	form.Set("grant_type", "refresh_token")
-	form.Set("client_id", rxtspot.GetClientID())
-	form.Set("refresh_token", refreshToken)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthURL+oauthTokenPath, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("authentication failed: %s", resp.Status)
-	}
-
-	var body struct {
-		IDToken string `json:"id_token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", fmt.Errorf("decoding token response: %w", err)
-	}
-	if body.IDToken == "" {
-		return "", errors.New("no id_token in authentication response")
-	}
-	return body.IDToken, nil
-}
-
 // expiry returns when a JWT expires, and whether it could be read at all. A
 // token we cannot parse reports false rather than a zero time, so callers can
 // tell "spent" from "unreadable" -- the two want different error messages.
@@ -354,16 +279,4 @@ func expiry(token string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return time.Unix(claims.Exp, 0), true
-}
-
-// expired reports whether a JWT is spent, or unusable for any other reason. A
-// token we cannot read is treated as expired: refreshing costs one request,
-// whereas sending a token we failed to parse costs a 401 that surfaces as a
-// misleading permissions error.
-func expired(token string) bool {
-	exp, ok := expiry(token)
-	if !ok {
-		return true
-	}
-	return time.Now().After(exp.Add(-expiryLeeway))
 }

@@ -11,10 +11,8 @@ You may obtain a copy of the License at
 package auth
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -60,15 +58,37 @@ func (r *recorder) headers() []string {
 	return append([]string(nil), r.seen...)
 }
 
-func newTestTransport(t *testing.T, seed string, mint func(int) string) (*Transport, *recorder, *atomic.Int32) {
-	t.Helper()
-	rec := &recorder{}
-	var calls atomic.Int32
-	tr := NewTransport(rec, "https://spot.example", "https://login.example", "refresh-token", seed)
-	tr.refresher = func(context.Context, string, string) (string, error) {
-		return mint(int(calls.Add(1))), nil
+// minter stands in for Rackspace: it answers the OAuth exchange with a token
+// from mint, and records every other request it is handed.
+type minter struct {
+	recorder
+	mint  func(int) string
+	calls atomic.Int32
+}
+
+func (m *minter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(req.URL.Path, oauthTokenPath) {
+		return m.recorder.RoundTrip(req)
 	}
-	return tr, rec, &calls
+	body, _ := json.Marshal(map[string]string{"id_token": m.mint(int(m.calls.Add(1)))})
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(body))), Header: http.Header{}, Request: req}, nil
+}
+
+// newTransport installs a Transport on an SDK client the way the operator does.
+func newTransport(base http.RoundTripper, baseURL, refreshToken, seed string) *Transport {
+	return Install(&rxtspot.RackspaceSpotClient{
+		BaseURL:      baseURL,
+		OAuthURL:     "https://login.example",
+		RefreshToken: refreshToken,
+		Token:        seed,
+		HTTPClient:   &http.Client{Transport: base},
+	})
+}
+
+func newTestTransport(t *testing.T, seed string, mint func(int) string) (*Transport, *minter, *atomic.Int32) {
+	t.Helper()
+	m := &minter{mint: mint}
+	return newTransport(m, "https://spot.example", "refresh-token", seed), m, &m.calls
 }
 
 func do(t *testing.T, tr *Transport, url string) {
@@ -137,16 +157,11 @@ func TestRoundTripRefreshesWithinLeeway(t *testing.T) {
 
 // Injecting a token into the token request would require already having one.
 func TestRoundTripSkipsOAuthEndpoint(t *testing.T) {
-	tr, rec, calls := newTestTransport(t, jwt(t, -time.Minute), func(int) string {
-		t.Error("refreshing while fetching a token would recurse")
-		return ""
-	})
+	rec := &recorder{}
+	tr := newTransport(rec, "https://spot.example", "refresh-token", jwt(t, -time.Minute))
 
 	do(t, tr, "https://login.example/oauth/token")
 
-	if got := calls.Load(); got != 0 {
-		t.Errorf("expected no refresh on the oauth path, got %d", got)
-	}
 	if h := rec.headers()[0]; h != "" {
 		t.Errorf("oauth request should go out unauthenticated, got %q", h)
 	}
@@ -192,10 +207,9 @@ func TestRoundTripDoesNotMutateRequest(t *testing.T) {
 	}
 }
 
-// A malformed or unparseable token is worth one wasted refresh; sending it
-// yields a 401 the SDK reports as a permissions error, which is what sent
-// people looking in the wrong place to begin with.
-func TestExpiredTreatsUnusableTokensAsExpired(t *testing.T) {
+// A token we cannot read must report as unreadable rather than as a zero
+// time, so the no-refresh-token path can tell "spent" from "unknown".
+func TestExpiryReportsUnreadableTokens(t *testing.T) {
 	for name, tok := range map[string]string{
 		"empty":          "",
 		"not a jwt":      "opaque-token",
@@ -203,12 +217,12 @@ func TestExpiredTreatsUnusableTokensAsExpired(t *testing.T) {
 		"bad base64":     "a.!!!.c",
 		"payload no exp": base64.RawURLEncoding.EncodeToString([]byte(`{}`)) + "." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"x"}`)) + ".s",
 	} {
-		if !expired(tok) {
-			t.Errorf("%s: expected to be treated as expired", name)
+		if _, ok := expiry(tok); ok {
+			t.Errorf("%s: expected the expiry to be unreadable", name)
 		}
 	}
-	if expired(jwt(t, time.Hour)) {
-		t.Error("a valid token was reported expired")
+	if _, ok := expiry(jwt(t, time.Hour)); !ok {
+		t.Error("a valid token was reported unreadable")
 	}
 }
 
@@ -220,7 +234,7 @@ func TestInstallPreservesUnderlyingTransport(t *testing.T) {
 
 	rec := &recorder{}
 	client := &http.Client{Transport: rec}
-	tr := NewTransport(client.Transport, srv.URL, "https://login.example", "rt", jwt(t, time.Hour))
+	tr := newTransport(client.Transport, srv.URL, "rt", jwt(t, time.Hour))
 	client.Transport = tr
 
 	if _, err := client.Get(srv.URL); err != nil {
@@ -231,14 +245,22 @@ func TestInstallPreservesUnderlyingTransport(t *testing.T) {
 	}
 }
 
+// failingOAuth rejects the token exchange, as Rackspace does for a revoked
+// refresh token, and records anything else.
+type failingOAuth struct{ recorder }
+
+func (f *failingOAuth) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, oauthTokenPath) {
+		return &http.Response{StatusCode: 400, Status: "400 Bad Request", Body: http.NoBody, Header: http.Header{}, Request: req}, nil
+	}
+	return f.recorder.RoundTrip(req)
+}
+
 // A refresh that fails must surface as an error rather than sending a request
 // with no usable credentials.
 func TestRoundTripPropagatesRefreshFailure(t *testing.T) {
-	rec := &recorder{}
-	tr := NewTransport(rec, "https://spot.example", "https://login.example", "rt", jwt(t, -time.Minute))
-	tr.refresher = func(context.Context, string, string) (string, error) {
-		return "", fmt.Errorf("refresh token revoked")
-	}
+	rec := &failingOAuth{}
+	tr := newTransport(rec, "https://spot.example", "rt", jwt(t, -time.Minute))
 	req, _ := http.NewRequest(http.MethodGet, "https://spot.example/x", nil)
 	if _, err := tr.RoundTrip(req); err == nil {
 		t.Fatal("expected an error when the refresh fails")
@@ -302,7 +324,7 @@ func TestRoundTripSendsTokenToEquivalentOrigins(t *testing.T) {
 // unconfigured base URL cannot produce a working request anyway.
 func TestRoundTripRefusesWithoutBaseURL(t *testing.T) {
 	rec := &recorder{}
-	tr := NewTransport(rec, "", "https://login.example", "rt", jwt(t, time.Hour))
+	tr := newTransport(rec, "", "rt", jwt(t, time.Hour))
 
 	req, err := http.NewRequest(http.MethodGet, "https://spot.example/x", nil)
 	if err != nil {
@@ -357,10 +379,10 @@ func TestInstallRefreshesOnACopyOfTheSDKClient(t *testing.T) {
 	if sdk.HTTPClient.Transport != tr {
 		t.Fatal("Install did not wire the Transport into the SDK client")
 	}
-	if got, want := tr.oauthClient.Timeout, 7*time.Second; got != want {
+	if got, want := tr.sdk.HTTPClient.Timeout, 7*time.Second; got != want {
 		t.Errorf("oauth client dropped the SDK's timeout: got %v want %v", got, want)
 	}
-	if tr.oauthClient.Transport != base {
+	if tr.sdk.HTTPClient.Transport != base {
 		t.Error("oauth client must keep the SDK's transport rather than the token injector or a bare default")
 	}
 
@@ -388,7 +410,7 @@ func TestInstallBoundsAnUntimedClient(t *testing.T) {
 
 	tr := Install(sdk)
 
-	if got := tr.oauthClient.Timeout; got != oauthTimeout {
+	if got := tr.sdk.HTTPClient.Timeout; got != oauthTimeout {
 		t.Errorf("oauth client left unbounded: timeout = %v", got)
 	}
 	if sdk.HTTPClient.Timeout != 0 {
@@ -413,7 +435,7 @@ func (c *closeCounter) Close() error {
 // failed request.
 func TestRoundTripClosesBodyOnError(t *testing.T) {
 	t.Run("no base url", func(t *testing.T) {
-		tr := NewTransport(&recorder{}, "", "https://login.example", "rt", jwt(t, time.Hour))
+		tr := newTransport(&recorder{}, "", "rt", jwt(t, time.Hour))
 		body := &closeCounter{}
 		req, err := http.NewRequest(http.MethodPost, "https://spot.example/x", body)
 		if err != nil {
@@ -428,10 +450,7 @@ func TestRoundTripClosesBodyOnError(t *testing.T) {
 	})
 
 	t.Run("refresh failed", func(t *testing.T) {
-		tr := NewTransport(&recorder{}, "https://spot.example", "https://login.example", "rt", jwt(t, -time.Minute))
-		tr.refresher = func(context.Context, string, string) (string, error) {
-			return "", fmt.Errorf("refresh token revoked")
-		}
+		tr := newTransport(&failingOAuth{}, "https://spot.example", "rt", jwt(t, -time.Minute))
 		body := &closeCounter{}
 		req, err := http.NewRequest(http.MethodPost, "https://spot.example/x", body)
 		if err != nil {
@@ -452,12 +471,11 @@ func TestRoundTripClosesBodyOnError(t *testing.T) {
 // cannot happen. The token here is one we cannot read, so we have no evidence
 // it is spent -- it goes out and Rackspace judges it.
 func TestTokenWithoutARefreshTokenPassesTheSeedThrough(t *testing.T) {
-	rec := &recorder{}
-	tr := NewTransport(rec, "https://spot.example", "https://login.example", "", "opaque-access-token")
-	tr.refresher = func(context.Context, string, string) (string, error) {
+	rec := &minter{mint: func(int) string {
 		t.Error("there is no refresh token to redeem")
-		return "", nil
-	}
+		return ""
+	}}
+	tr := newTransport(rec, "https://spot.example", "", "opaque-access-token")
 
 	do(t, tr, "https://spot.example/apis/ngpc.rxt.io/v1/serverclasses")
 
@@ -472,7 +490,7 @@ func TestTokenWithoutARefreshTokenPassesTheSeedThrough(t *testing.T) {
 // looking for a permissions problem to begin with.
 func TestTokenWithoutARefreshTokenReportsAnExpiredSeed(t *testing.T) {
 	rec := &recorder{}
-	tr := NewTransport(rec, "https://spot.example", "https://login.example", "", jwt(t, -time.Minute))
+	tr := newTransport(rec, "https://spot.example", "", jwt(t, -time.Minute))
 
 	_, err := tr.Token(t.Context())
 	if err == nil {
@@ -492,7 +510,7 @@ func TestTokenWithoutARefreshTokenReportsAnExpiredSeed(t *testing.T) {
 func TestTokenWithoutARefreshTokenSendsASeedInsideTheLeeway(t *testing.T) {
 	rec := &recorder{}
 	nearly := jwt(t, 30*time.Second) // inside the 60s leeway
-	tr := NewTransport(rec, "https://spot.example", "https://login.example", "", nearly)
+	tr := newTransport(rec, "https://spot.example", "", nearly)
 
 	do(t, tr, "https://spot.example/apis/ngpc.rxt.io/v1/serverclasses")
 
