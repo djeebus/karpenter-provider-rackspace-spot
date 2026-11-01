@@ -337,6 +337,12 @@ func hydrate(out *karpv1.NodeClaim, pool *instance.Pool, it *karpcloudprovider.I
 	out.Labels[corev1.LabelTopologyRegion] = region
 	out.Labels[corev1.LabelArchStable] = karpv1.ArchitectureAmd64
 	out.Labels[corev1.LabelOSStable] = string(corev1.Linux)
+	// The pool carries these too, but Rackspace copies pool labels onto the
+	// Node minutes after it joins. On the NodeClaim, Karpenter syncs them at
+	// registration, so Get and List can find the Node right away.
+	out.Labels[instance.KarpenterManagedLabel] = "true"
+	out.Labels[instance.NodeClaimNameLabel] = out.Name
+	out.Labels[instance.NodeClaimUIDLabel] = string(out.UID)
 }
 
 // poolToClaim materializes a minimal NodeClaim from an existing pool. Capacity
