@@ -1,0 +1,74 @@
+name: Downstream
+
+# Builds and pushes an image for every commit on the fork's `downstream`
+# branch: upstream main plus whatever fixes we're running ahead of a release.
+#
+# Tags are `<latest upstream tag>-downstream.<commits since tag>.g<short sha>`,
+# e.g. v0.1.5-downstream.38.g1a2b3c4. The commit count is a numeric SemVer
+# pre-release identifier, so tags sort in build order (a bare sha would sort
+# randomly), and the sha still pins the exact source.
+
+on:
+  push:
+    branches: [downstream]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: downstream
+  cancel-in-progress: false
+
+env:
+  KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
+  UPSTREAM: https://github.com/kanya-approve/karpenter-provider-rackspace-spot.git
+
+jobs:
+  publish:
+    name: test, build & push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Release tags live upstream, not on the fork.
+      - name: Fetch upstream tags
+        run: git fetch --no-tags "${UPSTREAM}" '+refs/tags/v*:refs/tags/v*'
+
+      - name: Derive version
+        id: ver
+        run: |
+          BASE=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*')
+          COUNT=$(git rev-list --count "${BASE}..HEAD")
+          VERSION="${BASE}-downstream.${COUNT}.g${GITHUB_SHA::7}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Downstream version: ${VERSION}"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: test
+        run: make test
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: ko-build/setup-ko@61b4d1d396f5b2e7d6bb6fefdce3dc38d1a13445 # v0.10
+
+      - name: Build & push
+        run: |
+          ko build --bare ./cmd/controller \
+            --platform=linux/amd64,linux/arm64 \
+            --tags=${{ steps.ver.outputs.version }},downstream
