@@ -56,14 +56,10 @@ func (c *Controller) Register(_ context.Context, mgr manager.Manager) error {
 		Complete(c)
 }
 
-// MachineAnnotation names the Cluster API Machine backing a Node:
-// <pool name>-<machineset hash>-<machine hash>.
-const MachineAnnotation = "cluster.x-k8s.io/machine"
-
 func managedNode() predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetLabels()[instance.KarpenterManagedLabel] == "true" ||
-			obj.GetAnnotations()[MachineAnnotation] != ""
+			obj.GetAnnotations()[instance.MachineAnnotation] != ""
 	})
 }
 
@@ -118,7 +114,7 @@ func (c *Controller) nodeClaimFor(ctx context.Context, node *corev1.Node) (*karp
 		return &nc, nil
 	}
 
-	machine := node.Annotations[MachineAnnotation]
+	machine := node.Annotations[instance.MachineAnnotation]
 	if machine == "" {
 		return nil, nil
 	}
