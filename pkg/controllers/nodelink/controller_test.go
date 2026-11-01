@@ -77,19 +77,19 @@ func TestReconcile(t *testing.T) {
 			// seconds of the Node joining but copies the pool labels minutes
 			// later; waiting for them runs claims past the registration timeout.
 			name:        "linked by machine annotation before labels sync",
-			annotations: map[string]string{MachineAnnotation: machineForPool},
+			annotations: map[string]string{instance.MachineAnnotation: machineForPool},
 			providerID:  openstackID,
 			want:        openstackID,
 		},
 		{
 			name:        "machine from a pool that is not a NodeClaim",
-			annotations: map[string]string{MachineAnnotation: "63351fa3-33fb-4048-a8de-9a4aa15fcb51-x8k2p-q7z4m"},
+			annotations: map[string]string{instance.MachineAnnotation: "63351fa3-33fb-4048-a8de-9a4aa15fcb51-x8k2p-q7z4m"},
 			providerID:  openstackID,
 			want:        provisionalID,
 		},
 		{
 			name:        "CCM has not set providerID yet",
-			annotations: map[string]string{MachineAnnotation: machineForPool},
+			annotations: map[string]string{instance.MachineAnnotation: machineForPool},
 			want:        provisionalID,
 		},
 	} {
@@ -113,7 +113,7 @@ func TestReconcile(t *testing.T) {
 func TestNodeClaimFor_RequiresFullPoolName(t *testing.T) {
 	node := &corev1.Node{}
 	node.Name = "prod-instance-1"
-	node.Annotations = map[string]string{MachineAnnotation: poolUID + "0-bvdch-gbkjh"}
+	node.Annotations = map[string]string{instance.MachineAnnotation: poolUID + "0-bvdch-gbkjh"}
 	node.Spec.ProviderID = openstackID
 
 	if got := reconcileNode(t, node, newNodeClaim()); got.Status.ProviderID != provisionalID {
@@ -130,7 +130,7 @@ func TestManagedNode(t *testing.T) {
 		want        bool
 	}{
 		{"managed label", map[string]string{instance.KarpenterManagedLabel: "true"}, nil, true},
-		{"machine annotation", nil, map[string]string{MachineAnnotation: machineForPool}, true},
+		{"machine annotation", nil, map[string]string{instance.MachineAnnotation: machineForPool}, true},
 		{"neither", nil, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
