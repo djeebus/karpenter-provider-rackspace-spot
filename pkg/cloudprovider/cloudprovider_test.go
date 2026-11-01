@@ -284,6 +284,7 @@ func TestCreate_AwaitsServerAssignment(t *testing.T) {
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nodeClass).Build()
 
 	nc := &karpv1.NodeClaim{}
+	nc.Name = "default-abc12"
 	nc.UID = "uid-1"
 	nc.Spec.NodeClassRef = &karpv1.NodeClassReference{Kind: NodeClassKind, Name: "default"}
 	nc.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
@@ -340,6 +341,18 @@ func TestCreate_AwaitsServerAssignment(t *testing.T) {
 			}
 			if claim.Labels[corev1.LabelInstanceTypeStable] != "gp.small" {
 				t.Errorf("instance-type label = %q, want gp.small", claim.Labels[corev1.LabelInstanceTypeStable])
+			}
+			// Karpenter copies NodeClaim labels onto the Node at registration;
+			// Get and List find the Node by these, long before Rackspace syncs
+			// the pool's copies.
+			for k, want := range map[string]string{
+				instance.KarpenterManagedLabel: "true",
+				instance.NodeClaimNameLabel:    "default-abc12",
+				instance.NodeClaimUIDLabel:     "uid-1",
+			} {
+				if got := claim.Labels[k]; got != want {
+					t.Errorf("label %s = %q, want %q", k, got, want)
+				}
 			}
 		})
 	}
