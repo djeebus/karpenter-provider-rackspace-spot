@@ -103,6 +103,17 @@ func (c *CloudProvider) Create(ctx context.Context, nc *karpv1.NodeClaim) (*karp
 		return nil, fmt.Errorf("creating pool: %w", err)
 	}
 
+	// On a retry the pool already exists, and the cheapest type may have
+	// changed since the attempt that created it. Describe the server the pool
+	// will actually get, not today's pick: hydrate stamps this type's label and
+	// capacity on the NodeClaim, and a mismatch both misleads the scheduler
+	// while we wait and fails the consistency check once the Node joins.
+	if pool.ServerClass != "" && pool.ServerClass != instType.Name {
+		if instType, err = c.instanceType.Get(ctx, c.region, pool.ServerClass); err != nil {
+			return nil, fmt.Errorf("resolving server class %s of pool %s: %w", pool.ServerClass, pool.Name, err)
+		}
+	}
+
 	// The cloudspace's AssignedServers can lag minutes behind the VM actually
 	// joining, and every minute spent here comes out of the registration
 	// timeout, which started when the NodeClaim was created. A Node from this
