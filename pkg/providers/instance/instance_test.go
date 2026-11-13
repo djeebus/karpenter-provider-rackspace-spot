@@ -59,6 +59,10 @@ func (*stubInstanceType) MinBidPrice(context.Context, string, string) (float64, 
 }
 
 func (*stubInstanceType) UpdateFromNode(string, corev1.ResourceList) {}
+func (*stubInstanceType) RecordFlavor(string, string)                {}
+func (*stubInstanceType) FlavorAliases([]*karpcloudprovider.InstanceType) []*karpcloudprovider.InstanceType {
+	return nil
+}
 
 const (
 	testOrgID      = "rxt-org-1"

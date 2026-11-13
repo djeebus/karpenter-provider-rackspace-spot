@@ -83,5 +83,8 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, nil
 	}
 	c.instanceTypeProvider.UpdateFromNode(instanceType, node.Status.Capacity)
+	if flavor := node.Labels[corev1.LabelInstanceTypeStable]; flavor != "" && flavor != instanceType {
+		c.instanceTypeProvider.RecordFlavor(flavor, instanceType)
+	}
 	return reconcile.Result{}, nil
 }

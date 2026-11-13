@@ -75,6 +75,12 @@ type Provider interface {
 	// type, so one node that boots with less than its predecessors ratchets the
 	// estimate down and nothing raises it back up.
 	UpdateFromNode(instanceType string, capacity corev1.ResourceList)
+	// RecordFlavor notes that a node launched as serverClass came up with its
+	// instance-type label set to flavor by the OpenStack CCM.
+	RecordFlavor(flavor, serverClass string)
+	// FlavorAliases returns an unlaunchable copy of each instance type in its,
+	// named after every flavor recorded for it.
+	FlavorAliases(its []*karpcloudprovider.InstanceType) []*karpcloudprovider.InstanceType
 }
 
 // CPU and pods are advertised exactly, so only these two are worth measuring.
@@ -91,6 +97,9 @@ type DefaultProvider struct {
 	// block nodes reporting capacity.
 	discoveredMu sync.Mutex
 	discovered   map[string]corev1.ResourceList
+
+	flavorMu sync.Mutex
+	flavors  map[string]string // Nova flavor -> ServerClass
 }
 
 type regionCache struct {
@@ -105,6 +114,7 @@ func NewProvider(client *rxtspot.RackspaceSpotClient) *DefaultProvider {
 		refreshAfter: 5 * time.Minute,
 		cache:        map[string]regionCache{},
 		discovered:   map[string]corev1.ResourceList{},
+		flavors:      map[string]string{},
 	}
 }
 
@@ -152,6 +162,53 @@ func (p *DefaultProvider) discoveredFor(instanceType string) corev1.ResourceList
 	p.discoveredMu.Lock()
 	defer p.discoveredMu.Unlock()
 	return p.discovered[instanceType].DeepCopy()
+}
+
+func (p *DefaultProvider) RecordFlavor(flavor, serverClass string) {
+	p.flavorMu.Lock()
+	defer p.flavorMu.Unlock()
+	p.flavors[flavor] = serverClass
+}
+
+// FlavorAliases works around the OpenStack CCM rewriting a node's
+// instance-type label from the ServerClass (gp.vs1.medium-ord) to the Nova
+// flavor (compute1-4), and re-applying it every few minutes. Karpenter's
+// disruption controller looks a node's instance type up by that label, so
+// without an instance type of that name every node is Unconsolidatable and
+// only empty nodes are ever removed. The aliases carry the ServerClass's
+// prices so consolidation can value the node, but no available offering, so
+// nothing is ever launched as one. Two ServerClasses that share a flavor
+// alias to whichever was seen last.
+func (p *DefaultProvider) FlavorAliases(its []*karpcloudprovider.InstanceType) []*karpcloudprovider.InstanceType {
+	p.flavorMu.Lock()
+	defer p.flavorMu.Unlock()
+	byName := lo.KeyBy(its, func(it *karpcloudprovider.InstanceType) string { return it.Name })
+	var aliases []*karpcloudprovider.InstanceType
+	for flavor, serverClass := range p.flavors {
+		it, ok := byName[serverClass]
+		if !ok || flavor == serverClass {
+			continue
+		}
+		if _, clash := byName[flavor]; clash {
+			continue
+		}
+		aliases = append(aliases, alias(it, flavor))
+	}
+	return aliases
+}
+
+func alias(it *karpcloudprovider.InstanceType, flavor string) *karpcloudprovider.InstanceType {
+	requirements := scheduling.NewRequirements(it.Requirements.Values()...)
+	requirements[corev1.LabelInstanceTypeStable] = scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, flavor)
+	return &karpcloudprovider.InstanceType{
+		Name:         flavor,
+		Requirements: requirements,
+		Offerings: lo.Map(it.Offerings, func(o *karpcloudprovider.Offering, _ int) *karpcloudprovider.Offering {
+			return &karpcloudprovider.Offering{Requirements: o.Requirements, Price: o.Price, Available: false}
+		}),
+		Capacity: it.Capacity,
+		Overhead: it.Overhead,
+	}
 }
 
 func (p *DefaultProvider) MinBidPrice(ctx context.Context, region, name string) (float64, error) {
