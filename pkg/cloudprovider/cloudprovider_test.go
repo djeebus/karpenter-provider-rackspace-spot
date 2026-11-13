@@ -59,6 +59,10 @@ func (s *stubInstanceTypeProvider) MinBidPrice(context.Context, string, string) 
 }
 
 func (s *stubInstanceTypeProvider) UpdateFromNode(string, corev1.ResourceList) {}
+func (s *stubInstanceTypeProvider) RecordFlavor(string, string)                {}
+func (s *stubInstanceTypeProvider) FlavorAliases([]*karpcloudprovider.InstanceType) []*karpcloudprovider.InstanceType {
+	return nil
+}
 
 // makeInstanceType mirrors instancetype.translate: one InstanceType with a spot
 // and/or on-demand offering (priced only when > 0), all available.

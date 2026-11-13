@@ -14,9 +14,11 @@ import (
 	"testing"
 
 	rxtspot "github.com/rackspace-spot/spot-go-sdk/api/v1"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpcloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
 func TestTranslate_CPUOnly(t *testing.T) {
@@ -228,5 +230,53 @@ func TestTranslate_DiscoveredCapacityReplacesEstimate(t *testing.T) {
 	// Byte-for-byte what that node reports as allocatable.
 	if got, want := it.Allocatable()[corev1.ResourceMemory], resource.MustParse("6457304Ki"); got.Cmp(want) != 0 {
 		t.Errorf("Memory allocatable = %q, want %q", got.String(), want.String())
+	}
+}
+
+func TestFlavorAliases_PricedButNeverLaunched(t *testing.T) {
+	p := NewProvider(nil)
+	sc := translate(rxtspot.ServerClass{
+		Name:                      "gp.vs1.medium-ord",
+		Region:                    "us-central-ord-1",
+		Availability:              "available",
+		OnDemandPricePerHour:      "0.10",
+		CurrentMarketPricePerHour: "0.01",
+		Resources:                 rxtspot.Resource{CPU: "2", Memory: "4GB"},
+	}, "40GB", nil)
+	p.RecordFlavor("compute1-4", sc.Name)
+
+	aliases := p.FlavorAliases([]*karpcloudprovider.InstanceType{sc})
+	if len(aliases) != 1 {
+		t.Fatalf("expected 1 alias, got %d", len(aliases))
+	}
+	a := aliases[0]
+	if a.Name != "compute1-4" {
+		t.Errorf("Name = %q, want compute1-4", a.Name)
+	}
+	if got := a.Requirements.Get(corev1.LabelInstanceTypeStable).Values(); len(got) != 1 || got[0] != "compute1-4" {
+		t.Errorf("instance-type requirement = %v, want [compute1-4]", got)
+	}
+	if got := sc.Requirements.Get(corev1.LabelInstanceTypeStable).Values(); len(got) != 1 || got[0] != sc.Name {
+		t.Errorf("aliasing changed the ServerClass's own requirement to %v", got)
+	}
+	if price, ok := a.OfferingPrice("us-central-ord-1", karpv1.CapacityTypeSpot); !ok || price != 0.01 {
+		t.Errorf("spot price = %v, %v; want 0.01, true", price, ok)
+	}
+	if n := len(a.Offerings.Available()); n != 0 {
+		t.Errorf("alias has %d available offerings, want 0", n)
+	}
+	if !sc.Offerings[0].Available {
+		t.Errorf("aliasing marked the ServerClass's own offering unavailable")
+	}
+}
+
+func TestFlavorAliases_SkipsUnlistedAndSelfNamed(t *testing.T) {
+	p := NewProvider(nil)
+	sc := &karpcloudprovider.InstanceType{Name: "mh.vs1.medium-ord"}
+	p.RecordFlavor("memory1-15", "mh.vs1.medium-iad") // not in this list
+	p.RecordFlavor("mh.vs1.medium-ord", sc.Name)      // label not rewritten yet
+
+	if aliases := p.FlavorAliases([]*karpcloudprovider.InstanceType{sc}); len(aliases) != 0 {
+		t.Errorf("expected no aliases, got %v", lo.Map(aliases, func(it *karpcloudprovider.InstanceType, _ int) string { return it.Name }))
 	}
 }

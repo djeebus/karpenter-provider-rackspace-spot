@@ -278,7 +278,12 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	if nodePool == nil || nodePool.Spec.Template.Spec.NodeClassRef == nil {
 		return nil, nil
 	}
-	return c.instanceType.List(ctx, c.region)
+	its, err := c.instanceType.List(ctx, c.region)
+	if err != nil {
+		return nil, err
+	}
+	// Only Karpenter sees the flavor aliases; launches pick from List directly.
+	return append(its, c.instanceType.FlavorAliases(its)...), nil
 }
 
 // ---- helpers ----
