@@ -1,7 +1,8 @@
 name: Downstream
 
-# Builds and pushes an image and Helm chart for every commit on the fork's `downstream`
-# branch: upstream main plus whatever fixes we're running ahead of a release.
+# Builds and pushes an image and Helm chart for every commit on the fork's
+# `downstream` branch: upstream main plus whatever fixes we're running ahead
+# of a release.
 #
 # Tags are `<latest upstream tag>-downstream.<commits since tag>.g<short sha>`,
 # e.g. v0.1.5-downstream.38.g1a2b3c4. The commit count is a numeric SemVer
@@ -72,3 +73,25 @@ jobs:
           ko build --bare ./cmd/controller \
             --platform=linux/amd64,linux/arm64 \
             --tags=${{ steps.ver.outputs.version }},downstream
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: latest
+
+      # The chart carries the karpenter.sh CRDs, so fixes to them only reach a
+      # cluster through a chart built from this branch. Same version as the
+      # image, minus the "v" (chart versions are bare SemVer).
+      - name: Package & push Helm chart
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          helm lint charts/karpenter
+          mkdir -p dist
+          helm package charts/karpenter \
+            --version "${VERSION#v}" \
+            --app-version "${VERSION}" \
+            --destination dist
+          echo "${REGISTRY_PASSWORD}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push "dist/karpenter-provider-rackspace-spot-${VERSION#v}.tgz" \
+            "oci://ghcr.io/${{ github.repository_owner }}/charts"
