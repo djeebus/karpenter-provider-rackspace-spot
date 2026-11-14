@@ -97,3 +97,9 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+// Fork-only: v1.14.1 plus kubernetes-sigs/karpenter#3618, so the disruption
+// replacement timeout (DISRUPTION_REPLACEMENT_TIMEOUT) can exceed 10 minutes;
+// Rackspace instances take about that long to initialize. Drop once a
+// Karpenter release has it.
+replace sigs.k8s.io/karpenter => github.com/djeebus/karpenter v1.14.2-0.20261114040719-3796f1d5e546
